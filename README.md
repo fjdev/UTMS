@@ -173,6 +173,151 @@ JSON files in `results/`: `{org}-{project}-{repo}.json` (Azure DevOps) or `{org}
 - `--filter local`: Show only local modules (not from Git)
 - Multiple filters can be specified (OR logic)
 
+## 🔄 CI/CD Integration
+
+### Azure Pipelines Example
+
+```yaml
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - '**/*.tf'
+      - '**/*.tfvars'
+
+schedules:
+  - cron: "0 2 * * 1"
+    displayName: Weekly module compliance scan
+    branches:
+      include:
+        - main
+    always: true
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  UTMS_VERSION: 'main'
+  FAIL_ON_OUTDATED: 'false'
+
+jobs:
+- job: Scan
+  displayName: Terraform Module Compliance Scan
+  pool:
+    vmImage: 'ubuntu-latest'
+  steps:
+  - checkout: self
+    persistCredentials: true
+
+  - task: UsePythonVersion@0
+    displayName: Use Python 3.x
+    inputs:
+      versionSpec: '3.x'
+
+  - script: |
+      curl -sSfL "https://raw.githubusercontent.com/fjdev/UTMS/$(UTMS_VERSION)/utms" -o utms
+      chmod +x utms
+    displayName: Download UTMS
+
+  - script: |
+      ./utms \
+        --source azure-devops \
+        --organization "$(System.TeamFoundationCollectionUri)" \
+        --project "$(System.TeamProject)" \
+        --repository "$(Build.Repository.Name)" \
+        --clean
+    displayName: Run UTMS Module Scan
+    env:
+      AZURE_DEVOPS_PAT: $(System.AccessToken)
+      GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+  - script: |
+      cat > generate_report.py << 'EOF'
+import json
+import sys
+from pathlib import Path
+
+result_file = Path("results").glob("*.json").__next__()
+with open(result_file) as f:
+    data = json.load(f)
+
+metadata = data.get("metadata", {})
+modules = data.get("modules", [])
+
+# Generate markdown report
+with open("module-report.md", "w") as report:
+    report.write(f"# Terraform Module Compliance Report\n\n")
+    report.write(f"**Repository:** {metadata.get('organization')}/{metadata.get('repository')}\n")
+    report.write(f"**Scan Date:** {metadata.get('scan_timestamp', 'N/A')}\n")
+    report.write(f"**Total Modules:** {metadata.get('total_modules_found', 0)}\n\n")
+    
+    # Summary statistics
+    outdated = [m for m in modules if m.get("is_outdated")]
+    local = [m for m in modules if m.get("source_type") == "local"]
+    uptodate = [m for m in modules if m.get("source_type") == "git" and not m.get("is_outdated")]
+    
+    report.write(f"## Summary\n\n")
+    report.write(f"- ✅ Up-to-date: {len(uptodate)}\n")
+    report.write(f"- ⚠️  Outdated: {len(outdated)}\n")
+    report.write(f"- 📁 Local: {len(local)}\n\n")
+    
+    # Detailed table
+    report.write(f"## Module Details\n\n")
+    report.write(f"| Status | File | Module | Source | Current | Latest |\n")
+    report.write(f"|--------|------|--------|--------|---------|--------|\n")
+    
+    for module in sorted(modules, key=lambda m: (m.get("file_path", ""), m.get("local_name", ""))):
+        file_path = module.get("file_path", "").lstrip("/")
+        local_name = module.get("local_name", "")
+        source = module.get("source", "")[:50] + "..." if len(module.get("source", "")) > 50 else module.get("source", "")
+        current = module.get("version") or "-"
+        latest = module.get("latest_version") or "-"
+        
+        if module.get("is_outdated"):
+            status = "⚠️ OUTDATED"
+        elif module.get("source_type") == "local":
+            status = "📁 LOCAL"
+        else:
+            status = "✅ UP-TO-DATE"
+        
+        report.write(f"| {status} | `{file_path}` | {local_name} | {source} | {current} | {latest} |\n")
+
+print(f"Report generated: {len(modules)} modules")
+print(f"  Up-to-date: {len(uptodate)}")
+print(f"  Outdated: {len(outdated)}")
+print(f"  Local: {len(local)}")
+sys.exit(1 if len(outdated) > 0 and "$(FAIL_ON_OUTDATED)" == "true" else 0)
+EOF
+      python3 generate_report.py
+    displayName: Generate markdown report
+    condition: always()
+
+  - task: PublishBuildArtifacts@1
+    displayName: Publish scan results
+    inputs:
+      PathtoPublish: 'results'
+      ArtifactName: 'module-scan-results'
+    condition: always()
+
+  - task: PublishBuildArtifacts@1
+    displayName: Publish markdown report
+    inputs:
+      PathtoPublish: 'module-report.md'
+      ArtifactName: 'module-report'
+    condition: always()
+```
+
+The pipeline generates both JSON (for automation) and a markdown report (for humans) with:
+- Summary statistics (up-to-date, outdated, local counts)
+- Detailed table with status flags (⚠️ OUTDATED, 📁 LOCAL, ✅ UP-TO-DATE)
+- Published as build artifacts
+
+Set `FAIL_ON_OUTDATED: 'true'` to enforce module version compliance.
+
 ## 🏗️ Architecture
 
 Single-responsibility design with authentication strategies, API client abstractions, centralized configuration, and comprehensive logging
