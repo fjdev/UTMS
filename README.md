@@ -201,7 +201,7 @@ pr:
       - main
 
 variables:
-  UTMS_VERSION: 'main'
+  UTMS_VERSION: 'v2.0.0'
   FAIL_ON_OUTDATED: 'false'
 
 jobs:
@@ -224,76 +224,123 @@ jobs:
     displayName: Download UTMS
 
   - script: |
+      COLLECTION_URI="$(System.TeamFoundationCollectionUri)"
+      COLLECTION_URI="${COLLECTION_URI%/}"
+      ORGANIZATION="${COLLECTION_URI##*/}"
+
+      PROJECT="$(System.TeamProject)"
+      REPOSITORY="$(Build.Repository.Name)"
+      BRANCH="$(Build.SourceBranchName)"
+
       ./utms \
         --source azure-devops \
-        --organization "$(System.TeamFoundationCollectionUri)" \
-        --project "$(System.TeamProject)" \
-        --repository "$(Build.Repository.Name)" \
+        --organization "$ORGANIZATION" \
+        --project "$PROJECT" \
+        --repository "$REPOSITORY" \
         --clean
     displayName: Run UTMS Module Scan
     env:
-      AZURE_DEVOPS_PAT: $(System.AccessToken)
+      AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
       GITHUB_TOKEN: $(GITHUB_TOKEN)
 
   - script: |
       cat > generate_report.py << 'EOF'
-import json
-import sys
-from pathlib import Path
+      import json
+      import os
+      import sys
+      import urllib.parse
+      from datetime import datetime, timezone
+      from zoneinfo import ZoneInfo
+      from pathlib import Path
 
-result_file = Path("results").glob("*.json").__next__()
-with open(result_file) as f:
-    data = json.load(f)
+      result_file = Path("results").glob("*.json").__next__()
+      with open(result_file) as f:
+          data = json.load(f)
 
-metadata = data.get("metadata", {})
-modules = data.get("modules", [])
+      metadata = data.get("metadata", {})
+      modules = data.get("modules", [])
 
-# Generate markdown report
-with open("module-report.md", "w") as report:
-    report.write(f"# Terraform Module Compliance Report\n\n")
-    report.write(f"**Repository:** {metadata.get('organization')}/{metadata.get('repository')}\n")
-    report.write(f"**Scan Date:** {metadata.get('scan_timestamp', 'N/A')}\n")
-    report.write(f"**Total Modules:** {metadata.get('total_modules_found', 0)}\n\n")
-    
-    # Summary statistics
-    outdated = [m for m in modules if m.get("is_outdated")]
-    local = [m for m in modules if m.get("source_type") == "local"]
-    uptodate = [m for m in modules if m.get("source_type") == "git" and not m.get("is_outdated")]
-    
-    report.write(f"## Summary\n\n")
-    report.write(f"- ✅ Up-to-date: {len(uptodate)}\n")
-    report.write(f"- ⚠️  Outdated: {len(outdated)}\n")
-    report.write(f"- 📁 Local: {len(local)}\n\n")
-    
-    # Detailed table
-    report.write(f"## Module Details\n\n")
-    report.write(f"| Status | File | Module | Source | Current | Latest |\n")
-    report.write(f"|--------|------|--------|--------|---------|--------|\n")
-    
-    for module in sorted(modules, key=lambda m: (m.get("file_path", ""), m.get("local_name", ""))):
-        file_path = module.get("file_path", "").lstrip("/")
-        local_name = module.get("local_name", "")
-        source = module.get("source", "")[:50] + "..." if len(module.get("source", "")) > 50 else module.get("source", "")
-        current = module.get("version") or "-"
-        latest = module.get("latest_version") or "-"
-        
-        if module.get("is_outdated"):
-            status = "⚠️ OUTDATED"
-        elif module.get("source_type") == "local":
-            status = "📁 LOCAL"
-        else:
-            status = "✅ UP-TO-DATE"
-        
-        report.write(f"| {status} | `{file_path}` | {local_name} | {source} | {current} | {latest} |\n")
+      collection_uri = (os.environ.get("SYSTEM_COLLECTIONURI") or "").rstrip("/")
+      organization = collection_uri.split("/")[-1] if collection_uri else metadata.get("organization", "")
+      project = os.environ.get("SYSTEM_TEAMPROJECT") or metadata.get("project", "")
+      repository = os.environ.get("BUILD_REPOSITORY_NAME") or metadata.get("repository", "")
+      branch = os.environ.get("BUILD_SOURCEBRANCHNAME") or "main"
 
-print(f"Report generated: {len(modules)} modules")
-print(f"  Up-to-date: {len(uptodate)}")
-print(f"  Outdated: {len(outdated)}")
-print(f"  Local: {len(local)}")
-sys.exit(1 if len(outdated) > 0 and "$(FAIL_ON_OUTDATED)" == "true" else 0)
-EOF
+      def file_link(path: str) -> str:
+          clean_path = path.lstrip("/")
+          if not (collection_uri and project and repository):
+              return f"`{clean_path}`"
+          path_q = urllib.parse.quote("/" + clean_path, safe="")
+          branch_q = urllib.parse.quote(branch, safe="")
+          url = f"{collection_uri}/{project}/_git/{repository}?path={path_q}&version=GB{branch_q}"
+          return f"[`{clean_path}`]({url})"
+
+      def format_scan_date(ts: str) -> str:
+          if not ts:
+              return "N/A"
+          try:
+              dt = datetime.fromisoformat(ts)
+              if dt.tzinfo is None:
+                  dt = dt.replace(tzinfo=timezone.utc)
+              ams = dt.astimezone(ZoneInfo("Europe/Amsterdam"))
+              return ams.strftime("%Y-%m-%d %H:%M %Z")
+          except Exception:
+              return ts
+
+      scan_date = format_scan_date(metadata.get("scan_timestamp", ""))
+
+      # Generate markdown report
+      with open("module-report.md", "w") as report:
+          report.write(f"# Terraform Module Compliance Report\n\n")
+          report.write(f"**Repository:** {metadata.get('organization')}/{metadata.get('repository')}\n")
+          report.write(f"**Scan Date:** {scan_date}\n")
+          report.write(f"**Total Modules:** {metadata.get('total_modules_found', 0)}\n\n")
+          
+          # Summary statistics
+          outdated = [m for m in modules if m.get("is_outdated")]
+          local = [m for m in modules if m.get("source_type") == "local"]
+          uptodate = [m for m in modules if m.get("source_type") == "git" and not m.get("is_outdated")]
+          
+          report.write(f"## Summary\n\n")
+          report.write(f"- ✅ Up-to-date: {len(uptodate)}\n")
+          report.write(f"- ⚠️  Outdated: {len(outdated)}\n")
+          report.write(f"- 📁 Local: {len(local)}\n\n")
+          
+          # Detailed table
+          report.write(f"## Module Details\n\n")
+          report.write(f"| Status | File | Module | Source | Current | Latest |\n")
+          report.write(f"|--------|------|--------|--------|---------|--------|\n")
+          
+          for module in sorted(modules, key=lambda m: (m.get("file_path", ""), m.get("local_name", ""))):
+              file_path = module.get("file_path", "")
+              local_name = module.get("local_name", "")
+              source = module.get("source", "")[:50] + "..." if len(module.get("source", "")) > 50 else module.get("source", "")
+              current = module.get("version") or "-"
+              latest = module.get("latest_version") or "-"
+              
+              if module.get("is_outdated"):
+                  status = "⚠️ OUTDATED"
+              elif module.get("source_type") == "local":
+                  status = "📁 LOCAL"
+              else:
+                  status = "✅ UP-TO-DATE"
+              
+              report.write(f"| {status} | {file_link(file_path)} | {local_name} | {source} | {current} | {latest} |\n")
+
+      print(f"Report generated: {len(modules)} modules")
+      print(f"  Up-to-date: {len(uptodate)}")
+      print(f"  Outdated: {len(outdated)}")
+      print(f"  Local: {len(local)}")
+      sys.exit(1 if len(outdated) > 0 and "$(FAIL_ON_OUTDATED)" == "true" else 0)
+      EOF
       python3 generate_report.py
     displayName: Generate markdown report
+    condition: always()
+
+  # Render markdown report directly in the pipeline summary
+  - script: |
+      echo "##vso[task.uploadsummary]$(System.DefaultWorkingDirectory)/module-report.md"
+    displayName: Publish report to pipeline summary
     condition: always()
 
   - task: PublishBuildArtifacts@1
@@ -301,13 +348,6 @@ EOF
     inputs:
       PathtoPublish: 'results'
       ArtifactName: 'module-scan-results'
-    condition: always()
-
-  - task: PublishBuildArtifacts@1
-    displayName: Publish markdown report
-    inputs:
-      PathtoPublish: 'module-report.md'
-      ArtifactName: 'module-report'
     condition: always()
 ```
 
