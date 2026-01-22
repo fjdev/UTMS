@@ -1,37 +1,12 @@
 #!/usr/bin/env python3
-"""
-Universal Terraform Module Scanner (UTMS)
-==========================================
-
-A professional tool for scanning source code repositories to discover and analyze 
-Terraform module references. UTMS connects to multiple source providers (Azure DevOps, 
-GitHub, etc.) to extract module usage patterns, versions, and generate comprehensive 
-reports.
-
-Features:
-- Multiple source provider support (Azure DevOps, GitHub)
-- Multiple authentication methods (environment, keychain, interactive)
-- Comprehensive Terraform module analysis
-- JSON output per source with console summary
-- Repository and project filtering support
-- Robust error handling and logging
-- Production-ready with proper OOP design
-
-Requirements:
-- Python 3.7+ 
-- Azure DevOps PAT token (for Azure DevOps scanning)
-- GitHub PAT token (for GitHub scanning)
-- Access to the target repositories
-
-Author: fjdev
-License: MIT
-Version: 1.0.0
-"""
+"""Universal Terraform Module Scanner (UTMS) - Scan repositories for Terraform module references."""
 
 # Standard library imports
+from __future__ import annotations
 import argparse
+import base64
 import concurrent.futures
-import functools
+import fnmatch
 from functools import lru_cache
 import json
 import logging
@@ -39,88 +14,42 @@ import os
 import re
 import signal
 import sys
-import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-
-# Advanced standard library imports
-from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
-__version__ = "1.0.0"
 __author__ = "fjdev"
 
 
 @dataclass
 class UTMSConfig:
     """Configuration constants for UTMS."""
-    # Byte conversion constants
-    BYTES_PER_KB: int = 1024  # bytes per kilobyte
-    
     # File scanning limits
     MAX_FILE_SIZE_MB: int = 1  # megabytes
-    MAX_FILE_SIZE_BYTES: int = MAX_FILE_SIZE_MB * BYTES_PER_KB * BYTES_PER_KB
+    MAX_FILE_SIZE_BYTES: int = 1048576  # 1MB in bytes
     
-    # API timeouts and limits
+    # API timeouts
     API_TIMEOUT_SECONDS: int = 30  # seconds
     TOKEN_VALIDATION_TIMEOUT: int = 10  # seconds
     
     # Performance settings
     MAX_CONCURRENT_FILES: int = 10  # Limit concurrent file processing
-    REPOSITORY_BATCH_SIZE: int = 5   # Process repos in batches
-    MAX_CONCURRENT_REPOS: int = 3   # Concurrent repository processing
     CACHE_SIZE_LIMIT: int = 1000    # LRU cache size for API responses
     STREAM_CHUNK_SIZE: int = 8192   # Bytes per streaming chunk
     MIN_FILE_SIZE_FOR_STREAMING: int = 102400  # 100KB - minimum size for streaming
     MIN_FILES_FOR_CONCURRENT_PROCESSING: int = 5  # Minimum files to use concurrent processing
     
-    # Authentication
-    KEYCHAIN_UPDATE_FLAG: str = '-U'  # Update if exists
-    
-    # Time constants
-    SECONDS_IN_MINUTE: int = 60  # seconds
-    SECONDS_IN_HOUR: int = 3600  # seconds
-    PERCENTAGE_MULTIPLIER: int = 100  # for percentage calculations
-    
-    # HTTP status codes
-    HTTP_OK: int = 200  # success status
-    HTTP_NOT_FOUND: int = 404  # not found status
-    
     # Debug and display
     CONTENT_PREVIEW_LENGTH: int = 200  # characters
     EXIT_CODE_INTERRUPT: int = 130  # keyboard interrupt
-    PROGRESS_BAR_LENGTH: int = 20  # characters
-    
-    # Module parsing constants
-    PUBLIC_REGISTRY_PARTS: int = 3  # namespace/name/provider
-    PRIVATE_REGISTRY_PARTS: int = 4  # hostname/namespace/name/provider
-    PROVIDER_INDEX_OFFSET: int = 3  # Index offset to get provider from end
-    NAME_INDEX_OFFSET: int = 2  # Index offset to get name from end
-    VERSION_PARTS_COUNT: int = 3  # Major.minor.patch format
-    CONSTRAINT_OFFSET_PESSIMISTIC: int = 2  # Characters to skip for ~> constraint
-    
-    # Version parsing constants
-    VERSION_COMPONENT_COUNT: int = 3
-    VERSION_MAJOR_INDEX: int = 0
-    VERSION_MINOR_INDEX: int = 1
-    VERSION_PATCH_INDEX: int = 2
     
     # Logging formats
-    DEFAULT_LOG_FORMAT: str = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    DEFAULT_DATE_FORMAT: str = '%Y-%m-%d %H:%M:%S'
-    
-    # Logging
-    DEFAULT_LOG_FORMAT: str = '%(asctime)s - %(levelname)s - %(message)s'
-    DEFAULT_DATE_FORMAT: str = '%H:%M:%S'
-    
-    # Display formatting constants
-    ANSI_BOLD: str = '\033[1m'      # Bold text
-    ANSI_RESET: str = '\033[0m'     # Reset formatting
+    LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
+    LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 
 def safe_print(*args, **kwargs):
@@ -136,36 +65,21 @@ def safe_print(*args, **kwargs):
         sys.exit(0)
 
 
-def format_progress(current: int, total: int, prefix: str = "") -> str:
-    """Format a progress indicator string."""
-    if total == 0:
-        return f"{prefix}[0/0]"
-    
-    percentage = (current / total) * UTMSConfig.PERCENTAGE_MULTIPLIER
-    bar_length = UTMSConfig.PROGRESS_BAR_LENGTH
-    filled_length = int(bar_length * current // total)
-    bar = '█' * filled_length + '░' * (bar_length - filled_length)
-    
-    return f"{prefix}[{current}/{total}] {bar} {percentage:.1f}%"
-
-
 def format_duration(seconds: float) -> str:
     """Format duration in human-readable format."""
-    if seconds < UTMSConfig.SECONDS_IN_MINUTE:
+    if seconds < 60:
         return f"{seconds:.1f}s"
-    elif seconds < UTMSConfig.SECONDS_IN_HOUR:
-        minutes = seconds / UTMSConfig.SECONDS_IN_MINUTE
-        return f"{minutes:.1f}m"
+    elif seconds < 3600:
+        return f"{seconds / 60:.1f}m"
     else:
-        hours = seconds / UTMSConfig.SECONDS_IN_HOUR
-        return f"{hours:.1f}h"
+        return f"{seconds / 3600:.1f}h"
 
 
 # Configure logging - default to WARNING, INFO only in debug mode
 logging.basicConfig(
     level=logging.WARNING,
-    format=UTMSConfig.DEFAULT_LOG_FORMAT,
-    datefmt=UTMSConfig.DEFAULT_DATE_FORMAT
+    format=UTMSConfig.LOG_FORMAT,
+    datefmt=UTMSConfig.LOG_DATE_FORMAT
 )
 logger = logging.getLogger(__name__)
 
@@ -174,6 +88,12 @@ class SourceType(Enum):
     """Supported source types for scanning."""
     AZURE_DEVOPS = "azure-devops"
     GITHUB = "github"
+
+
+class ModuleSourceType(Enum):
+    """Supported Terraform module source types."""
+    LOCAL = "local"
+    GIT = "git"
 
 
 class APIError(Exception):
@@ -186,14 +106,10 @@ class BaseAPIClient:
     
     def _make_api_request(self, url: str, headers: dict) -> dict:
         """Make an authenticated API request with comprehensive error handling."""
-        import urllib.request
-        import urllib.error
-        import json
-        
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=UTMSConfig.API_TIMEOUT_SECONDS) as response:
-                if response.status == UTMSConfig.HTTP_OK:
+                if response.status == 200:
                     return json.loads(response.read().decode())
                 else:
                     raise APIError(f"API request failed with status {response.status}")
@@ -213,87 +129,42 @@ class ScanError(Exception):
     pass
 
 
+class AuthenticationError(Exception):
+    """Raised when authentication fails."""
+    pass
+
+
 @dataclass(frozen=True)
 class ModuleReference:
-    """Represents a Terraform module reference found in source code."""
+    """Terraform module reference with source path, version, and location info."""
     source: str
-    local_name: str = ""  # The local name used to refer to this module instance
+    local_name: str = ""
     version: Optional[str] = None
     file_path: str = ""
     line_number: int = 0
     project_name: str = ""
     repository_name: str = ""
+    source_type: ModuleSourceType = ModuleSourceType.LOCAL
+    latest_version: Optional[str] = None
+    is_outdated: Optional[bool] = None
     
     def __post_init__(self):
         """Validate module reference after initialization."""
         if not self.source:
             raise ValueError("Module source cannot be empty")
-    
-    @property
-    def is_registry_module(self) -> bool:
-        """Check if this is a Terraform Registry module."""
-        # Skip local paths and various non-registry sources
-        if (self.source.startswith(('./', '../', '/', '~')) or 
-            self.source.startswith(('git::', 'hg::', 'http://', 'https://', 's3::', 'gcs::')) or
-            'github.com' in self.source or 'bitbucket.org' in self.source):
-            return False
-        
-        # Registry modules have format: namespace/name/provider or hostname/namespace/name/provider
-        parts = self.source.split('/')
-        
-        # Must have exactly 3 parts (public registry) or 4 parts (private registry)
-        if len(parts) == UTMSConfig.PUBLIC_REGISTRY_PARTS:
-            return True  # namespace/name/provider format
-        elif len(parts) == UTMSConfig.PRIVATE_REGISTRY_PARTS and '.' in parts[0]:
-            return True  # hostname/namespace/name/provider format
-        
-        return False
-    
-    @property
-    def namespace(self) -> Optional[str]:
-        """Extract namespace from registry module source."""
-        if not self.is_registry_module:
-            return None
-        parts = self.source.split('/')
-        return parts[-UTMSConfig.PROVIDER_INDEX_OFFSET]  # Works for both 3-part and 4-part formats
-    
-    @property
-    def name(self) -> Optional[str]:
-        """Extract name from registry module source."""
-        if not self.is_registry_module:
-            return None
-        parts = self.source.split('/')
-        return parts[-UTMSConfig.NAME_INDEX_OFFSET]
-    
-    @property
-    def provider(self) -> Optional[str]:
-        """Extract provider from registry module source."""
-        if not self.is_registry_module:
-            return None
-        parts = self.source.split('/')
-        return parts[-1]
-    
-    @property
-    def registry_hostname(self) -> Optional[str]:
-        """Extract registry hostname (for private registries)."""
-        if not self.is_registry_module:
-            return None
-        parts = self.source.split('/')
-        if len(parts) == UTMSConfig.PRIVATE_REGISTRY_PARTS:
-            return parts[0]
-        return "registry.terraform.io"  # Default public registry
 
 
 @dataclass  
 class ScanResult:
-    """Represents the results of scanning a source."""
+    """Results from scanning a repository for Terraform modules."""
     source_type: SourceType
     organization: str
     project_name: str = ""
     repository_name: str = ""
     total_files_scanned: int = 0
     total_modules_found: int = 0
-    registry_modules_found: int = 0
+    local_modules_found: int = 0
+    git_modules_found: int = 0
     repository_accessible: bool = True
     modules: List[ModuleReference] = field(default_factory=list)
     scan_timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -302,295 +173,14 @@ class ScanResult:
         """Add a module reference to the results."""
         self.modules.append(module_ref)
         self.total_modules_found += 1
-        if module_ref.is_registry_module:
-            self.registry_modules_found += 1
-
-
-class VersionConstraintResolver:
-    """Resolves Terraform version constraints against available versions."""
-    
-    @staticmethod
-    def parse_version(version_str: str) -> Tuple[int, int, int]:
-        """Parse a semantic version string into (major, minor, patch) tuple."""
-        # Remove 'v' prefix if present
-        version_str = version_str.lstrip('v')
-        
-        # Handle pre-release and build metadata
-        base_version = version_str.split('-')[0].split('+')[0]
-        
-        parts = base_version.split('.')
-        if len(parts) < UTMSConfig.VERSION_COMPONENT_COUNT:
-            # Pad with zeros if needed
-            parts.extend(['0'] * (UTMSConfig.VERSION_COMPONENT_COUNT - len(parts)))
-        
-        try:
-            return (int(parts[UTMSConfig.VERSION_MAJOR_INDEX]), 
-                    int(parts[UTMSConfig.VERSION_MINOR_INDEX]), 
-                    int(parts[UTMSConfig.VERSION_PATCH_INDEX]))
-        except ValueError:
-            raise ValueError(f"Invalid version format: {version_str}")
-    
-    @staticmethod
-    def version_matches_constraint(version: str, constraint: str) -> bool:
-        """Check if a version satisfies a constraint."""
-        if not constraint or constraint == "*":
-            return True
-        
-        constraint = constraint.strip()
-        
-        # Handle special "latest" constraint
-        if constraint.lower() == "latest":
-            return True  # "latest" matches all versions (will be filtered to actual latest in resolve_constraint)
-        
-        # Handle multiple constraints separated by commas
-        if ',' in constraint:
-            return all(VersionConstraintResolver.version_matches_constraint(version, c.strip()) 
-                      for c in constraint.split(','))
-        
-        # Parse version or return False if invalid
-        try:
-            v_major, v_minor, v_patch = VersionConstraintResolver.parse_version(version)
-        except ValueError:
-            return False
-        
-        # Delegate to specific constraint checkers
-        return VersionConstraintResolver._check_specific_constraint(constraint, v_major, v_minor, v_patch)
-    
-    @staticmethod
-    def _check_specific_constraint(constraint: str, v_major: int, v_minor: int, v_patch: int) -> bool:
-        """Check a specific constraint type against parsed version components."""
-        # Exact version
-        if constraint.startswith('=') or (not any(op in constraint for op in ['~>', '>=', '<=', '>', '<', '!='])):
-            return VersionConstraintResolver._check_exact_constraint(constraint, v_major, v_minor, v_patch)
-        
-        # Pessimistic constraint (~>)
-        if constraint.startswith('~>'):
-            return VersionConstraintResolver._check_pessimistic_constraint(constraint, v_major, v_minor, v_patch)
-        
-        # Comparison constraints
-        if constraint.startswith('>='):
-            return VersionConstraintResolver._check_greater_equal_constraint(constraint, v_major, v_minor, v_patch)
-        
-        if constraint.startswith('<='):
-            return VersionConstraintResolver._check_less_equal_constraint(constraint, v_major, v_minor, v_patch)
-        
-        if constraint.startswith('>') and not constraint.startswith('>='):
-            return VersionConstraintResolver._check_greater_constraint(constraint, v_major, v_minor, v_patch)
-        
-        if constraint.startswith('<') and not constraint.startswith('<='):
-            return VersionConstraintResolver._check_less_constraint(constraint, v_major, v_minor, v_patch)
-        
-        if constraint.startswith('!='):
-            return VersionConstraintResolver._check_not_equal_constraint(constraint, v_major, v_minor, v_patch)
-        
-        return False
-    
-    @staticmethod
-    def _check_exact_constraint(constraint: str, v_major: int, v_minor: int, v_patch: int) -> bool:
-        """Check exact version constraint."""
-        target_version = constraint.lstrip('=').strip()
-        try:
-            t_major, t_minor, t_patch = VersionConstraintResolver.parse_version(target_version)
-            return (v_major, v_minor, v_patch) == (t_major, t_minor, t_patch)
-        except ValueError:
-            return False
-    
-    @staticmethod
-    def _check_pessimistic_constraint(constraint: str, v_major: int, v_minor: int, v_patch: int) -> bool:
-        """Check pessimistic constraint (~>)."""
-        target_version = constraint[UTMSConfig.CONSTRAINT_OFFSET_PESSIMISTIC:].strip()
-        try:
-            # Parse the constraint version
-            target_parts = target_version.lstrip('v').split('-')[0].split('+')[0].split('.')
-            t_major, t_minor, t_patch = VersionConstraintResolver.parse_version(target_version)
-            
-            # Must be >= the target version
-            if (v_major, v_minor, v_patch) < (t_major, t_minor, t_patch):
-                return False
-            
-            if len(target_parts) == 1:
-                # ~> 1 means >= 1.0.0, < 2.0.0 
-                return v_major == t_major
-            elif len(target_parts) == UTMSConfig.NAME_INDEX_OFFSET:
-                # ~> 1.1 means >= 1.1.0, < 2.0.0
-                return v_major == t_major
-            else:
-                # ~> 1.1.4 means >= 1.1.4, < 1.2.0
-                return v_major == t_major and v_minor == t_minor
-        except ValueError:
-            return False
-    
-    @staticmethod
-    def _check_greater_equal_constraint(constraint: str, v_major: int, v_minor: int, v_patch: int) -> bool:
-        """Check greater than or equal constraint (>=)."""
-        target_version = constraint[2:].strip()
-        try:
-            t_major, t_minor, t_patch = VersionConstraintResolver.parse_version(target_version)
-            return (v_major, v_minor, v_patch) >= (t_major, t_minor, t_patch)
-        except ValueError:
-            return False
-    
-    @staticmethod
-    def _check_less_equal_constraint(constraint: str, v_major: int, v_minor: int, v_patch: int) -> bool:
-        """Check less than or equal constraint (<=)."""
-        target_version = constraint[2:].strip()
-        try:
-            t_major, t_minor, t_patch = VersionConstraintResolver.parse_version(target_version)
-            return (v_major, v_minor, v_patch) <= (t_major, t_minor, t_patch)
-        except ValueError:
-            return False
-    
-    @staticmethod
-    def _check_greater_constraint(constraint: str, v_major: int, v_minor: int, v_patch: int) -> bool:
-        """Check greater than constraint (>)."""
-        target_version = constraint[1:].strip()
-        try:
-            t_major, t_minor, t_patch = VersionConstraintResolver.parse_version(target_version)
-            return (v_major, v_minor, v_patch) > (t_major, t_minor, t_patch)
-        except ValueError:
-            return False
-    
-    @staticmethod
-    def _check_less_constraint(constraint: str, v_major: int, v_minor: int, v_patch: int) -> bool:
-        """Check less than constraint (<)."""
-        target_version = constraint[1:].strip()
-        try:
-            t_major, t_minor, t_patch = VersionConstraintResolver.parse_version(target_version)
-            return (v_major, v_minor, v_patch) < (t_major, t_minor, t_patch)
-        except ValueError:
-            return False
-    
-    @staticmethod
-    def _check_not_equal_constraint(constraint: str, v_major: int, v_minor: int, v_patch: int) -> bool:
-        """Check not equal constraint (!=)."""
-        target_version = constraint[2:].strip()
-        try:
-            t_major, t_minor, t_patch = VersionConstraintResolver.parse_version(target_version)
-            return (v_major, v_minor, v_patch) != (t_major, t_minor, t_patch)
-        except ValueError:
-            return True  # If we can't parse, assume it's not equal
-    
-    @staticmethod
-    def resolve_constraint(constraint: str, available_versions: List[str]) -> Dict[str, any]:
-        """
-        Resolve a constraint against available versions.
-        
-        Returns:
-            Dict with resolved_versions, latest_matching, and constraint_info
-        """
-        if not available_versions:
-            return VersionConstraintResolver._create_empty_result(constraint)
-        
-        # Determine constraint type
-        constraint_type = VersionConstraintResolver._determine_constraint_type(constraint)
-        
-        # Handle "latest" constraint specially
-        if constraint.lower() == 'latest':
-            return VersionConstraintResolver._resolve_latest_constraint(constraint, available_versions, constraint_type)
-        
-        # Find matching versions for other constraints
-        matching_versions = VersionConstraintResolver._find_matching_versions(constraint, available_versions)
-        
-        # Sort and return results
-        return VersionConstraintResolver._create_constraint_result(constraint, matching_versions, constraint_type)
-    
-    @staticmethod
-    def _create_empty_result(constraint: str) -> Dict[str, any]:
-        """Create empty result for when no versions are available."""
-        return {
-            'constraint': constraint,
-            'resolved_versions': [],
-            'latest_matching': None,
-            'total_matching': 0,
-            'constraint_type': 'unknown'
-        }
-    
-    @staticmethod
-    def _determine_constraint_type(constraint: str) -> str:
-        """Determine the type of version constraint."""
-        if constraint.lower() == 'latest':
-            return 'latest'
-        elif constraint.startswith('~>'):
-            return 'pessimistic'
-        elif constraint.startswith('>='):
-            return 'minimum'
-        elif constraint.startswith('<='):
-            return 'maximum'
-        elif constraint.startswith('>'):
-            return 'greater_than'
-        elif constraint.startswith('<'):
-            return 'less_than'
-        elif constraint.startswith('!='):
-            return 'not_equal'
-        elif ',' in constraint:
-            return 'range'
-        elif not constraint or constraint == "*":
-            return 'any'
-        else:
-            return 'exact'
-    
-    @staticmethod
-    def _resolve_latest_constraint(constraint: str, available_versions: List[str], constraint_type: str) -> Dict[str, any]:
-        """Handle 'latest' constraint resolution."""
-        try:
-            sorted_versions = sorted(
-                available_versions,
-                key=lambda v: VersionConstraintResolver.parse_version(v),
-                reverse=True
-            )
-            latest_version = sorted_versions[0] if sorted_versions else None
-            return {
-                'constraint': constraint,
-                'resolved_versions': [latest_version] if latest_version else [],
-                'latest_matching': latest_version,
-                'total_matching': 1 if latest_version else 0,
-                'constraint_type': constraint_type
-            }
-        except ValueError:
-            # Fallback to string sorting if version parsing fails
-            sorted_versions = sorted(available_versions, reverse=True)
-            latest_version = sorted_versions[0] if sorted_versions else None
-            return {
-                'constraint': constraint,
-                'resolved_versions': [latest_version] if latest_version else [],
-                'latest_matching': latest_version,
-                'total_matching': 1 if latest_version else 0,
-                'constraint_type': constraint_type
-            }
-    
-    @staticmethod
-    def _find_matching_versions(constraint: str, available_versions: List[str]) -> List[str]:
-        """Find versions that match the given constraint."""
-        matching_versions = []
-        for version in available_versions:
-            if VersionConstraintResolver.version_matches_constraint(version, constraint):
-                matching_versions.append(version)
-        return matching_versions
-    
-    @staticmethod
-    def _create_constraint_result(constraint: str, matching_versions: List[str], constraint_type: str) -> Dict[str, any]:
-        """Create the final constraint resolution result."""
-        # Sort versions (newest first)
-        try:
-            matching_versions.sort(
-                key=lambda v: VersionConstraintResolver.parse_version(v),
-                reverse=True
-            )
-        except ValueError:
-            # Fallback to string sorting if version parsing fails
-            matching_versions.sort(reverse=True)
-        
-        return {
-            'constraint': constraint,
-            'resolved_versions': matching_versions,
-            'latest_matching': matching_versions[0] if matching_versions else None,
-            'total_matching': len(matching_versions),
-            'constraint_type': constraint_type
-        }
+        if module_ref.source_type == ModuleSourceType.LOCAL:
+            self.local_modules_found += 1
+        elif module_ref.source_type == ModuleSourceType.GIT:
+            self.git_modules_found += 1
 
 
 class TerraformFileScanner:
-    """Scans Terraform files for module references with caching."""
+    """Scans Terraform files for module references."""
     
     def __init__(self):
         # Primary configuration files that can contain module blocks
@@ -615,29 +205,15 @@ class TerraformFileScanner:
             '.terraformrc',      # CLI configuration
             'terraform.rc'       # CLI configuration (Windows)
         ]
-        
-        # Cache for compiled regex patterns (performance optimization)
-        self._constraint_pattern_cache = {}
     
     def _is_valid_terraform_version_constraint(self, version_str: str) -> bool:
-        """
-        Check if a version string looks like a valid Terraform module version constraint.
-        
-        Valid constraints:
-        - Semantic versions: "1.0.0", "2.1.3"
-        - Version ranges: "~> 1.0", ">= 1.0.0", "< 2.0.0"
-        - Complex constraints: ">= 1.0.0, < 2.0.0"
-        
-        Invalid (likely not module constraints):
-        - Plain words: "latest", "stable", "production"
-        - Non-semantic versions: "windows", "linux", "v1"
-        """
+        """Check if version string is a valid Terraform constraint or Git ref."""
         if not version_str:
             return False
             
         version_str = version_str.strip()
         
-        # Check for common Terraform version constraint patterns
+        # Check for common Terraform version constraint patterns (semantic versions)
         constraint_patterns = [
             r'^~>\s*\d+(\.\d+)*',           # Pessimistic: ~> 1.0, ~> 1.2.3
             r'^>=\s*\d+(\.\d+)*',           # Greater than equal: >= 1.0.0
@@ -650,8 +226,19 @@ class TerraformFileScanner:
             r'^\d+(\.\d+)*\s*,\s*',         # Complex constraints with commas
         ]
         
-        import re
         for pattern in constraint_patterns:
+            if re.match(pattern, version_str):
+                return True
+        
+        # Check for Git refs (tags, branches, commit SHAs)
+        git_ref_patterns = [
+            r'^v\d+(\.\d+)*',                      # Version tags: v1.0.0, v1.2
+            r'^[a-zA-Z][a-zA-Z0-9_-]*',            # Branch names: main, develop, feature/something
+            r'^[0-9a-f]{7,40}$',                   # Commit SHAs: short (7+) or full (40 char)
+            r'^[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+$',  # Refs with slashes: refs/tags/v1.0.0
+        ]
+        
+        for pattern in git_ref_patterns:
             if re.match(pattern, version_str):
                 return True
         
@@ -668,19 +255,42 @@ class TerraformFileScanner:
             
         return False
     
-    def scan_content(self, content: str, file_path: str, project_name: str = "", repository_name: str = "") -> List[ModuleReference]:
-        """
-        Scan content of a Terraform file for module references.
+    def detect_module_source_type(self, source: str) -> ModuleSourceType:
+        """Detect if module source is LOCAL or GIT."""
+        if not source:
+            return ModuleSourceType.LOCAL  # Default fallback
         
-        Args:
-            content: File content to scan
-            file_path: Path to the file being scanned
-            project_name: Name of the project containing the file
-            repository_name: Name of the repository containing the file
+        # Check if it's a Git repository
+        if source.startswith(('git::', 'git@', 'ssh://', 'git://')):
+            return ModuleSourceType.GIT
+        
+        # Check if it's an HTTPS Git repository (git::https://)
+        if source.startswith('git::https://') or source.startswith('git::http://'):
+            return ModuleSourceType.GIT
+        
+        # Everything else is considered LOCAL (including ./path, ../path, /absolute/path, ~/home/path)
+        return ModuleSourceType.LOCAL
+    
+    def _extract_git_revision(self, source: str) -> Optional[str]:
+        """Extract Git revision from query parameters (ref= or version=)."""
+        if '?' not in source:
+            return None
+        
+        try:
+            # Extract query string portion
+            query_string = source.split('?', 1)[1]
             
-        Returns:
-            List of module references found
-        """
+            # Look for ref= or version= parameter
+            match = re.search(r'(?:ref|version)=([^&]+)', query_string)
+            if match:
+                return match.group(1)
+        except Exception:
+            pass
+        
+        return None
+    
+    def scan_content(self, content: str, file_path: str, project_name: str, repository_name: str) -> List[ModuleReference]:
+        """Scan Terraform file content for module references."""
         modules = []
         
         if file_path.endswith('.tf.json'):
@@ -738,7 +348,6 @@ class TerraformFileScanner:
         
         try:
             # Find the local name between quotes
-            import re
             match = re.search(r'module\s+"([^"]+)"', line)
             if match:
                 module_info['local_name'] = match.group(1)
@@ -773,18 +382,27 @@ class TerraformFileScanner:
         if 'source' not in module_data:
             return None
         
+        source = module_data['source']
+        source_type = self.detect_module_source_type(source)
+        
+        # For Git sources, extract revision from query parameters
+        version = module_data.get('version')
+        if source_type == ModuleSourceType.GIT and not version:
+            version = self._extract_git_revision(source)
+        
         module_ref = ModuleReference(
-            source=module_data['source'],
+            source=source,
             local_name=module_data.get('local_name', 'unknown'),
-            version=module_data.get('version'),
+            version=version,
             file_path=file_path,
             line_number=module_data['line_number'],
             project_name=project_name,
-            repository_name=repository_name
+            repository_name=repository_name,
+            source_type=source_type
         )
         
-        # Only include valid Terraform Registry modules
-        if module_ref.is_registry_module and self.validate_module_reference(module_ref):
+        # Validate the module reference
+        if self.validate_module_reference(module_ref):
             return module_ref
         
         return None
@@ -794,7 +412,6 @@ class TerraformFileScanner:
         modules = []
         
         try:
-            import json
             data = json.loads(content)
             
             # Look for module blocks in JSON structure
@@ -804,11 +421,13 @@ class TerraformFileScanner:
                         source = module_config.get('source')
                         version = module_config.get('version')
                         
-                        # Only include version if it looks like a valid constraint
-                        if version and not self._is_valid_terraform_version_constraint(version):
-                            version = None
-                        
                         if source:
+                            source_type = self.detect_module_source_type(source)
+                            
+                            # For Git sources, extract revision from query parameters if not specified
+                            if source_type == ModuleSourceType.GIT and not version:
+                                version = self._extract_git_revision(source)
+                            
                             module_ref = ModuleReference(
                                 source=source,
                                 local_name=module_name,  # In JSON, the key is the local name
@@ -816,11 +435,12 @@ class TerraformFileScanner:
                                 file_path=file_path,
                                 line_number=1,  # JSON doesn't have meaningful line numbers for blocks
                                 project_name=project_name,
-                                repository_name=repository_name
+                                repository_name=repository_name,
+                                source_type=source_type
                             )
                             
-                            # Only include valid Terraform Registry modules
-                            if module_ref.is_registry_module and self.validate_module_reference(module_ref):
+                            # Validate the module reference
+                            if self.validate_module_reference(module_ref):
                                 modules.append(module_ref)
         
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -834,8 +454,6 @@ class TerraformFileScanner:
     
     def should_ignore_path(self, file_path: str) -> bool:
         """Check if a file path should be ignored during scanning."""
-        import fnmatch
-        
         for pattern in self.ignore_patterns:
             if fnmatch.fnmatch(file_path, pattern) or pattern in file_path:
                 return True
@@ -846,31 +464,24 @@ class TerraformFileScanner:
         return any(file_path.endswith(pattern) for pattern in self.variable_file_patterns)
     
     def validate_module_reference(self, module_ref: ModuleReference) -> bool:
-        """Validate that a module reference is correctly parsed."""
+        """Validate module reference has correct format for its source type."""
         if not module_ref.source:
             return False
         
-        # For registry modules, validate the format
-        if module_ref.is_registry_module:
-            parts = module_ref.source.split('/')
-            
-            # Must have valid namespace, name, and provider
-            if len(parts) == 3:
-                namespace, name, provider = parts
-            elif len(parts) == 4:
-                hostname, namespace, name, provider = parts
-                # Hostname should look like a domain
-                if '.' not in hostname:
-                    return False
-            else:
-                return False
-            
-            # Basic validation of parts (no empty strings, reasonable characters)
-            for part in [namespace, name, provider]:
-                if not part or not part.replace('-', '').replace('_', '').isalnum():
-                    return False
+        source_type = module_ref.source_type
         
-        return True
+        if source_type == ModuleSourceType.LOCAL:
+            # Local paths should not be empty after stripping
+            source = module_ref.source.strip()
+            return len(source) > 0
+        
+        elif source_type == ModuleSourceType.GIT:
+            # Git URLs should start with git:: or git@ or ssh:// or git://
+            source = module_ref.source.lower()
+            valid_prefixes = ('git::', 'git@', 'ssh://', 'git://')
+            return source.startswith(valid_prefixes)
+        
+        return False
 
 
 # Repository Discovery and Scanning Classes
@@ -903,220 +514,95 @@ class RepositoryDiscovery(BaseAPIClient):
         self.source_type = source_type
         self.auth_manager = auth_manager
     
-    def discover_repositories(self, organization: str, token: str, project_filter: List[str] = None) -> List[Repository]:
-        """
-        Discover all accessible repositories in the organization.
-        
-        Args:
-            organization: Organization name
-            token: Authentication token
-            project_filter: Optional list of specific projects to scan
-            
-        Returns:
-            List of Repository objects
-        """
+    def get_repository(self, organization: str, project: str, repository_name: str, token: str) -> Optional[Repository]:
+        """Get a specific repository."""
         if self.source_type == SourceType.AZURE_DEVOPS:
-            return self._discover_azure_devops_repositories(organization, token, project_filter)
-        elif self.source_type == SourceType.GITHUB:
-            return self._discover_github_repositories(organization, token)
-        else:
-            raise ValueError(f"Unsupported source type: {self.source_type}")
+            return self._get_azure_devops_repository(organization, project, repository_name, token)
+        if self.source_type == SourceType.GITHUB:
+            return self._get_github_repository(organization, repository_name, token)
+        raise ValueError(f"Unsupported source type: {self.source_type}")
     
-    def _discover_azure_devops_repositories(self, organization: str, token: str, project_filter: List[str] = None) -> List[Repository]:
-        """Discover Azure DevOps repositories."""
-        repositories = []
+    def _get_azure_devops_repository(self, organization: str, project: str, repository_name: str, token: str) -> Optional[Repository]:
+        """Get a specific Azure DevOps repository."""
         headers = self.auth_manager.get_headers(self.source_type, token)
         
         try:
-            # First, get all projects
-            projects_url = f'https://dev.azure.com/{organization}/_apis/projects?api-version=6.0'
-            projects = self._make_api_request(projects_url, headers)
+            # Get the repository details directly
+            repo_url = f'https://dev.azure.com/{organization}/{project}/_apis/git/repositories/{repository_name}?api-version=6.0'
+            repo = self._make_api_request(repo_url, headers)
             
-            for project in projects.get('value', []):
-                project_name = project['name']
-                project_id = project['id']
-                
-                # Apply project filter if specified
-                if project_filter and project_name not in project_filter:
-                    logger.debug(f"Skipping project {project_name} (not in filter)")
-                    continue
-                
-                logger.info(f"📁 Discovering repositories in project: {project_name}")
-                
-                # Get repositories for this project
-                repos_url = f'https://dev.azure.com/{organization}/{project_id}/_apis/git/repositories?api-version=6.0'
-                repos_data = self._make_api_request(repos_url, headers)
-                
-                for repo in repos_data.get('value', []):
-                    repository = Repository(
-                        name=repo['name'],
-                        id=repo['id'],
-                        project_name=project_name,
-                        project_id=project_id,
-                        default_branch=repo.get('defaultBranch', 'refs/heads/main').replace('refs/heads/', ''),
-                        web_url=repo.get('webUrl', ''),
-                        clone_url=repo.get('remoteUrl', ''),
-                        size_kb=repo.get('size', 0),
-                        source_type=self.source_type
-                    )
-                    repositories.append(repository)
-                    logger.debug(f"  📂 Found repository: {repo['name']}")
-        
+            if repo:
+                return Repository(
+                    name=repo['name'],
+                    id=repo['id'],
+                    project_name=project,
+                    project_id=repo.get('project', {}).get('id', ''),
+                    default_branch=repo.get('defaultBranch', 'refs/heads/main').replace('refs/heads/', ''),
+                    web_url=repo.get('webUrl', ''),
+                    clone_url=repo.get('remoteUrl', ''),
+                    size_kb=repo.get('size', 0),
+                    source_type=self.source_type
+                )
         except Exception as e:
-            logger.error(f"Error discovering Azure DevOps repositories: {e}")
-            raise
+            logger.error(f"Error getting Azure DevOps repository: {e}")
+            return None
         
-        logger.info(f"✅ Discovered {len(repositories)} repositories across {len(set(r.project_name for r in repositories))} projects")
-        return repositories
+        return None
     
-    def _discover_github_repositories(self, organization: str, token: str) -> List[Repository]:
-        """Discover GitHub repositories (placeholder for future implementation)."""
-        # TODO: Implement GitHub repository discovery
-        logger.warning("🚧 GitHub repository discovery not yet implemented")
-        return []
+    def _get_github_repository(self, organization: str, repository_name: str, token: str) -> Optional[Repository]:
+        """Get a specific GitHub repository."""
+        headers = self.auth_manager.get_headers(self.source_type, token)
+        
+        try:
+            # Get the repository details
+            repo_url = f'https://api.github.com/repos/{organization}/{repository_name}'
+            repo = self._make_api_request(repo_url, headers)
+            
+            if repo:
+                return Repository(
+                    name=repo['name'],
+                    id=str(repo['id']),
+                    project_name=organization,
+                    project_id=organization,
+                    default_branch=repo.get('default_branch', 'main'),
+                    web_url=repo.get('html_url', ''),
+                    clone_url=repo.get('clone_url', ''),
+                    size_kb=repo.get('size', 0),
+                    source_type=self.source_type
+                )
+        except Exception as e:
+            logger.error(f"Error getting GitHub repository: {e}")
+            return None
+        
+        return None
 
 
 class RepositoryScanner(BaseAPIClient):
     """Scans repositories for Terraform files and module references."""
     
-    def __init__(self, source_type: SourceType, auth_manager: 'AuthenticationManager', file_scanner: TerraformFileScanner):
+    def __init__(self, source_type: SourceType, auth_manager: 'AuthenticationManager', file_scanner: TerraformFileScanner, version_checker: 'GitModuleVersionChecker'):
         self.source_type = source_type
         self.auth_manager = auth_manager
         self.file_scanner = file_scanner
+        self.version_checker = version_checker
         self.max_file_size_bytes = UTMSConfig.MAX_FILE_SIZE_BYTES
         self.use_concurrent_processing = True  # Enable concurrent processing by default
-        self._scan_cache = {}  # Cache for API responses
-        self._cache_lock = threading.Lock()
-    
-    def scan_repositories_concurrent(self, repositories: List[Repository], organization: str, token: str, progress_callback=None) -> List[ScanResult]:
-        """
-        Scan multiple repositories concurrently for improved performance.
-        
-        Args:
-            repositories: List of repositories to scan
-            organization: Organization name
-            token: Authentication token
-            progress_callback: Optional callback for progress updates
-            
-        Returns:
-            List of ScanResult objects
-        """
-        logger.info(f"🚀 Starting concurrent repository scanning ({UTMSConfig.MAX_CONCURRENT_REPOS} workers)")
-        
-        all_results = []
-        completed_count = 0
-        
-        # Process repositories in batches to control memory usage
-        batch_size = self._calculate_batch_size()
-        
-        for batch_start in range(0, len(repositories), batch_size):
-            batch_end = min(batch_start + batch_size, len(repositories))
-            batch_repos = repositories[batch_start:batch_end]
-            
-            logger.debug(f"Processing batch {batch_start//batch_size + 1}: repositories {batch_start+1}-{batch_end}")
-            
-            batch_results, completed_count = self._process_repository_batch(
-                batch_repos, organization, token, progress_callback, 
-                completed_count, len(repositories)
-            )
-            all_results.extend(batch_results)
-        
-        logger.info(f"✅ Concurrent scanning completed. Processed {len(repositories)} repositories")
-        return all_results
-    
-    def _calculate_batch_size(self) -> int:
-        """Calculate optimal batch size for repository processing."""
-        return UTMSConfig.REPOSITORY_BATCH_SIZE * UTMSConfig.MAX_CONCURRENT_REPOS
-    
-    def _process_repository_batch(self, batch_repos: List[Repository], organization: str, 
-                                token: str, progress_callback, completed_count: int, 
-                                total_repos: int) -> Tuple[List[ScanResult], int]:
-        """Process a batch of repositories concurrently."""
-        batch_results = []
-        
-        # Scan batch concurrently
-        with ThreadPoolExecutor(max_workers=UTMSConfig.MAX_CONCURRENT_REPOS) as executor:
-            # Submit all repositories in this batch
-            future_to_repo = {
-                executor.submit(self.scan_repository, repo, organization, token): repo 
-                for repo in batch_repos
-            }
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_repo):
-                repo = future_to_repo[future]
-                completed_count += 1
-                
-                try:
-                    result = future.result()
-                    batch_results.append(result)
-                    
-                    # Call progress callback if provided
-                    if progress_callback:
-                        progress_callback(completed_count, total_repos, result)
-                        
-                except Exception as e:
-                    logger.error(f"Error scanning repository {repo.full_name}: {e}")
-                    # Create failed result
-                    failed_result = self._create_failed_result(organization, repo)
-                    batch_results.append(failed_result)
-        
-        return batch_results, completed_count
-    
-    def _create_failed_result(self, organization: str, repo: Repository) -> ScanResult:
-        """Create a failed scan result for a repository."""
-        failed_result = ScanResult(
-            source_type=self.source_type,
-            organization=organization,
-            project_name=repo.project_name,
-            repository_name=repo.name
-        )
-        failed_result.repository_accessible = False
-        return failed_result
     
     @lru_cache(maxsize=UTMSConfig.CACHE_SIZE_LIMIT)
     def _cached_api_request(self, url: str, headers_tuple: tuple) -> dict:
-        """
-        Make cached API request to avoid redundant calls.
-        
-        Args:
-            url: API endpoint URL
-            headers_tuple: Headers as tuple (for hashability)
-            
-        Returns:
-            API response data
-        """
+        """Make cached API request to avoid redundant calls."""
         # Convert tuple back to dict for the actual request
         headers = dict(headers_tuple)
         return self._make_api_request(url, headers)
     
     def _make_cached_request(self, url: str, headers: dict) -> dict:
-        """
-        Make an API request with caching support.
-        
-        Args:
-            url: API endpoint URL
-            headers: Request headers
-            
-        Returns:
-            API response data
-        """
+        """Make an API request with caching support."""
         # Convert headers to tuple for caching (tuples are hashable)
         headers_tuple = tuple(sorted(headers.items()))
         return self._cached_api_request(url, headers_tuple)
     
     def scan_repository(self, repository: Repository, organization: str, token: str) -> ScanResult:
-        """
-        Scan a single repository for Terraform module references.
-        
-        Args:
-            repository: Repository to scan
-            organization: Organization name
-            token: Authentication token
-            
-        Returns:
-            ScanResult with discovered modules
-        """
+        """Scan repository for Terraform module references."""
         logger.info(f"🔍 Scanning repository: {repository.full_name}")
         
         result = ScanResult(
@@ -1127,24 +613,30 @@ class RepositoryScanner(BaseAPIClient):
         )
         
         try:
+            # Precompute headers once to avoid repeated auth_manager calls
+            headers = self.auth_manager.get_headers(self.source_type, token)
+            
             # Get file tree and validate repository access
-            terraform_files = self._get_and_validate_files(repository, organization, token, result)
+            terraform_files = self._get_and_validate_files(repository, organization, token, headers, result)
             if not result.repository_accessible:
                 return result
             
             # Scan each file for module references
-            self._scan_terraform_files(repository, organization, token, terraform_files, result)
+            self._scan_terraform_files(repository, organization, token, headers, terraform_files, result)
+            
+            # Check versions for Git modules
+            self._check_module_versions(result, token)
         
         except Exception as e:
             logger.error(f"Error scanning repository {repository.full_name}: {e}")
         
-        logger.info(f"  ✅ Found {result.registry_modules_found} registry modules in {repository.name}")
+        logger.info(f"  ✅ Found {result.local_modules_found} local + {result.git_modules_found} git modules in {repository.name}")
         return result
     
-    def _get_and_validate_files(self, repository: Repository, organization: str, token: str, result: ScanResult) -> List[dict]:
+    def _get_and_validate_files(self, repository: Repository, organization: str, token: str, headers: Dict[str, str], result: ScanResult) -> List[dict]:
         """Get terraform files from repository and validate access."""
         # Get file tree from repository
-        terraform_files = self._discover_terraform_files(repository, organization, token)
+        terraform_files = self._discover_terraform_files(repository, organization, token, headers)
         result.total_files_scanned = len(terraform_files)
         
         logger.info(f"  📄 Found {len(terraform_files)} Terraform files")
@@ -1159,90 +651,145 @@ class RepositoryScanner(BaseAPIClient):
         
         return terraform_files
     
-    def _scan_terraform_files(self, repository: Repository, organization: str, token: str, 
+    def _scan_terraform_files(self, repository: Repository, organization: str, token: str, headers: Dict[str, str],
                              terraform_files: List[dict], result: ScanResult) -> None:
         """Scan each terraform file for module references."""
         # Use concurrent processing for larger file sets
         if self.use_concurrent_processing and len(terraform_files) > UTMSConfig.MIN_FILES_FOR_CONCURRENT_PROCESSING:
-            self._scan_terraform_files_concurrent(repository, organization, token, terraform_files, result)
+            self._scan_terraform_files_concurrent(repository, organization, token, headers, terraform_files, result)
         else:
-            self._scan_terraform_files_sequential(repository, organization, token, terraform_files, result)
+            self._scan_terraform_files_sequential(repository, organization, token, headers, terraform_files, result)
     
-    def _scan_terraform_files_sequential(self, repository: Repository, organization: str, token: str, 
+    def _scan_terraform_files_sequential(self, repository: Repository, organization: str, token: str, headers: Dict[str, str],
                                        terraform_files: List[dict], result: ScanResult) -> None:
         """Scan terraform files sequentially (original method)."""
         for file_info in terraform_files:
             try:
-                logger.debug(f"    🔍 Scanning file: {file_info['path']} ({file_info.get('size', 0)} bytes)")
-                file_content = self._get_file_content(repository, file_info, organization, token)
-                
-                if file_content:
-                    self._process_file_content(file_info, file_content, repository, result)
-                else:
-                    logger.debug(f"    ❌ Could not retrieve file content")
-            
+                modules = self._process_single_file(repository, file_info, organization, token, headers)
+                for module in modules:
+                    result.add_module(module)
+                if modules:
+                    logger.info(f"    📦 {file_info['path']}: {len(modules)} modules")
             except Exception as e:
                 logger.warning(f"    ⚠️ Error scanning {file_info['path']}: {e}")
                 continue
     
-    def _scan_terraform_files_concurrent(self, repository: Repository, organization: str, token: str, 
+    def _scan_terraform_files_concurrent(self, repository: Repository, organization: str, token: str, headers: Dict[str, str],
                                        terraform_files: List[dict], result: ScanResult) -> None:
         """Scan terraform files concurrently for improved performance."""
         logger.debug(f"    🚀 Using concurrent file processing ({UTMSConfig.MAX_CONCURRENT_FILES} workers)")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=UTMSConfig.MAX_CONCURRENT_FILES) as executor:
-            # Create futures for file processing
             future_to_file = {
-                executor.submit(self._process_single_file, repository, file_info, organization, token): file_info
+                executor.submit(self._process_single_file, repository, file_info, organization, token, headers): file_info
                 for file_info in terraform_files
             }
             
-            # Collect results as they complete
             for future in concurrent.futures.as_completed(future_to_file):
                 file_info = future_to_file[future]
                 try:
                     modules = future.result()
+                    for module in modules:
+                        result.add_module(module)
                     if modules:
-                        for module in modules:
-                            result.add_module(module)
                         logger.info(f"    📦 {file_info['path']}: {len(modules)} modules")
                 except Exception as e:
                     logger.warning(f"    ⚠️ Error processing file {file_info['path']}: {e}")
     
-    def _process_single_file(self, repository: Repository, file_info: dict, organization: str, token: str) -> List['TerraformModule']:
+    def _process_single_file(self, repository: Repository, file_info: dict, organization: str, token: str, headers: Dict[str, str]) -> List['ModuleReference']:
         """Process a single file and return discovered modules (for concurrent processing)."""
         logger.debug(f"    🔍 Scanning file: {file_info['path']} ({file_info.get('size', 0)} bytes)")
-        file_content = self._get_file_content(repository, file_info, organization, token)
+        file_content = self._get_file_content(repository, file_info, organization, headers)
         
-        if file_content:
-            logger.debug(f"    📖 Retrieved content: {len(file_content)} characters")
-            
-            # Debug: Show first characters of content
-            preview = file_content[:UTMSConfig.CONTENT_PREVIEW_LENGTH].replace('\n', '\\n').replace('\r', '\\r')
-            logger.debug(f"    👀 Content preview: {preview}")
-            
-            # Check if content contains module blocks
-            if 'module ' in file_content:
-                logger.debug(f"    🎯 File contains 'module ' blocks")
-            else:
-                logger.debug(f"    ➡️  File does not contain module blocks")
-            
-            modules = self.file_scanner.scan_content(
-                content=file_content,
-                file_path=file_info['path'],
-                project_name=repository.project_name,
-                repository_name=repository.name
-            )
-            
-            logger.debug(f"    📊 Scan result: {len(modules)} modules found")
-            return modules
-        else:
+        if not file_content:
             logger.debug(f"    ❌ Could not retrieve file content")
             return []
+        
+        # Log content preview for debugging
+        preview = file_content[:UTMSConfig.CONTENT_PREVIEW_LENGTH].replace('\n', '\\n').replace('\r', '\\r')
+        logger.debug(f"    👀 Content preview: {preview}")
+        
+        # Check if content contains module blocks
+        if 'module ' in file_content:
+            logger.debug(f"    🎯 File contains 'module ' blocks")
+        else:
+            logger.debug(f"    ➡️  File does not contain module blocks")
+        
+        modules = self.file_scanner.scan_content(
+            content=file_content,
+            file_path=file_info['path'],
+            project_name=repository.project_name,
+            repository_name=repository.name
+        )
+        
+        logger.debug(f"    📊 Scan result: {len(modules)} modules found")
+        for module in modules:
+            logger.debug(f"    ✅ Module '{module.local_name}': {module.source} (type: {module.source_type.value})")
+        
+        return modules
     
-    def _process_file_content(self, file_info: dict, file_content: str, repository: Repository, result: ScanResult) -> None:
-        """Process the content of a single terraform file."""
-        logger.debug(f"    📖 Retrieved content: {len(file_content)} characters")
+    def _check_module_versions(self, result: ScanResult, token: str) -> None:
+        """Check versions for all Git modules and update result."""
+        git_modules = [m for m in result.modules if m.source_type == ModuleSourceType.GIT]
+        
+        if not git_modules:
+            return
+        
+        logger.info(f"  🔍 Checking versions for {len(git_modules)} Git modules...")
+        
+        # Set tokens for version checking
+        # Try to get GitHub token from environment if not the primary source
+        github_token = None
+        azure_token = None
+        
+        if self.source_type == SourceType.GITHUB:
+            github_token = token
+        elif self.source_type == SourceType.AZURE_DEVOPS:
+            azure_token = token
+            # Try to get GitHub token from environment for cross-platform checks
+            github_token = self.auth_manager.authenticate(SourceType.GITHUB, "")
+        
+        self.version_checker.set_tokens(azure_token=azure_token, github_token=github_token)
+        
+        # Create a new list with version info
+        updated_modules = []
+        outdated_count = 0
+        
+        for module in result.modules:
+            if module.source_type == ModuleSourceType.GIT:
+                latest_version, is_outdated = self.version_checker.check_module_version(module)
+                
+                # Create updated module with version info
+                updated_module = ModuleReference(
+                    source=module.source,
+                    local_name=module.local_name,
+                    version=module.version,
+                    file_path=module.file_path,
+                    line_number=module.line_number,
+                    project_name=module.project_name,
+                    repository_name=module.repository_name,
+                    source_type=module.source_type,
+                    latest_version=latest_version,
+                    is_outdated=is_outdated
+                )
+                updated_modules.append(updated_module)
+                
+                if is_outdated:
+                    outdated_count += 1
+                    logger.info(f"    ⚠️  {module.local_name}: {module.version} → {latest_version} (outdated)")
+                elif latest_version:
+                    logger.debug(f"    ✅ {module.local_name}: {module.version or 'no version'} (latest: {latest_version})")
+            else:
+                updated_modules.append(module)
+        
+        # Replace modules list with updated one
+        result.modules.clear()
+        result.modules.extend(updated_modules)
+        
+        if outdated_count > 0:
+            logger.info(f"  ⚠️  {outdated_count} outdated Git module(s) detected")
+    
+    def _discover_terraform_files(self, repository: Repository, organization: str, token: str, headers: Dict[str, str]) -> List[dict]:
         
         # Debug: Show first characters of content
         preview = file_content[:UTMSConfig.CONTENT_PREVIEW_LENGTH].replace('\n', '\\n').replace('\r', '\\r')
@@ -1262,18 +809,14 @@ class RepositoryScanner(BaseAPIClient):
         )
         
         logger.debug(f"    📊 Scan result: {len(modules)} modules found")
-        
         for module in modules:
-            logger.debug(f"    ✅ Module '{module.local_name}': {module.source} (registry: {module.is_registry_module})")
-            result.add_module(module)
+            logger.debug(f"    ✅ Module '{module.local_name}': {module.source} (type: {module.source_type.value})")
         
-        if modules:
-            logger.info(f"    📦 {file_info['path']}: {len(modules)} modules")
+        return modules
     
-    def _discover_terraform_files(self, repository: Repository, organization: str, token: str) -> List[dict]:
+    def _discover_terraform_files(self, repository: Repository, organization: str, token: str, headers: Dict[str, str]) -> List[dict]:
         """Discover all Terraform files in the repository."""
         terraform_files = []
-        headers = self.auth_manager.get_headers(self.source_type, token)
         
         try:
             if self.source_type == SourceType.AZURE_DEVOPS:
@@ -1295,18 +838,37 @@ class RepositoryScanner(BaseAPIClient):
                                 'objectId': item['objectId'],
                                 'size': item.get('size', 0)
                             })
+            
+            elif self.source_type == SourceType.GITHUB:
+                # Get file tree from GitHub
+                tree_url = f'https://api.github.com/repos/{organization}/{repository.name}/git/trees/{repository.default_branch}?recursive=1'
+                tree_data = self._make_api_request(tree_url, headers)
+                
+                for item in tree_data.get('tree', []):
+                    if item.get('type') == 'blob':  # It's a file
+                        file_path = item['path']
+                        
+                        # Check if it's a Terraform file and not ignored
+                        if (self.file_scanner.is_terraform_file(file_path) and 
+                            not self.file_scanner.should_ignore_path(file_path) and
+                            not self.file_scanner.is_variable_file(file_path)):
+                            
+                            terraform_files.append({
+                                'path': file_path,
+                                'sha': item['sha'],
+                                'size': item.get('size', 0)
+                            })
         
         except Exception as e:
-            # Parse Azure DevOps specific errors for better user experience
-            error_message = str(e)
-            if "TF401019" in error_message and "does not exist or you do not have permissions" in error_message:
-                logger.debug(f"Repository {repository.full_name} is disabled or inaccessible (TF401019)")
+            # Parse platform-specific errors for better user experience
+            error_str = str(e)
+            ignored_errors = {"TF401019", "404"}
+            
+            if any(err in error_str for err in ignored_errors):
+                logger.debug(f"Repository {repository.full_name} is disabled or inaccessible")
                 return []  # Return empty list to indicate no files accessible
-            elif str(UTMSConfig.HTTP_NOT_FOUND) in error_message:
-                logger.debug(f"Repository {repository.full_name} not found or access denied ({UTMSConfig.HTTP_NOT_FOUND})")
-                return []  # Return empty list to indicate no files accessible
-            else:
-                logger.warning(f"Error discovering files in {repository.full_name}: {e}")
+            
+            logger.warning(f"Error discovering files in {repository.full_name}: {e}")
         
         return terraform_files
     
@@ -1320,16 +882,18 @@ class RepositoryScanner(BaseAPIClient):
                 repo_url = f'https://dev.azure.com/{organization}/{repository.project_id}/_apis/git/repositories/{repository.id}?api-version=6.0'
                 self._make_api_request(repo_url, headers)
                 return True
+            elif self.source_type == SourceType.GITHUB:
+                # Try to get repository info (lightweight call)
+                repo_url = f'https://api.github.com/repos/{organization}/{repository.name}'
+                self._make_api_request(repo_url, headers)
+                return True
         except Exception as e:
-            error_message = str(e)
-            if "TF401019" in error_message or str(UTMSConfig.HTTP_NOT_FOUND) in error_message:
-                return False
-            # For other errors, assume accessible (might be temporary issue)
-            return True
+            error_str = str(e)
+            return not any(err in error_str for err in ["TF401019", "404"])
         
         return True
     
-    def _get_file_content(self, repository: Repository, file_info: dict, organization: str, token: str) -> Optional[str]:
+    def _get_file_content(self, repository: Repository, file_info: dict, organization: str, headers: Dict[str, str]) -> Optional[str]:
         """Get the content of a specific file."""
         file_size = file_info.get('size', 0)
         
@@ -1340,49 +904,77 @@ class RepositoryScanner(BaseAPIClient):
         
         # Use streaming for larger files to improve memory efficiency
         if file_size > UTMSConfig.MIN_FILE_SIZE_FOR_STREAMING:
-            return self._get_file_content_streaming(repository, file_info, organization, token)
+            return self._get_file_content_streaming(repository, file_info, organization, headers)
         else:
-            return self._get_file_content_direct(repository, file_info, organization, token)
+            return self._get_file_content_direct(repository, file_info, organization, headers)
     
-    def _get_file_content_direct(self, repository: Repository, file_info: dict, organization: str, token: str) -> Optional[str]:
+    def _get_file_content_direct(self, repository: Repository, file_info: dict, organization: str, headers: Dict[str, str]) -> Optional[str]:
         """Get file content directly (for smaller files)."""
-        headers = self.auth_manager.get_headers(self.source_type, token)
         
         try:
             if self.source_type == SourceType.AZURE_DEVOPS:
                 # Get file content from Azure DevOps using the correct API endpoint
                 # We need to add &$format=text to get actual content instead of JSON metadata
-                import urllib.parse
                 encoded_path = urllib.parse.quote(file_info['path'])
                 content_url = f"https://dev.azure.com/{organization}/{repository.project_id}/_apis/git/repositories/{repository.id}/items?path={encoded_path}&$format=text&api-version=6.0"
                 
-                import urllib.request
                 req = urllib.request.Request(content_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=UTMSConfig.API_TIMEOUT_SECONDS) as response:
-                    if response.status == UTMSConfig.HTTP_OK:
+                    if response.status == 200:
                         return response.read().decode('utf-8', errors='ignore')
+            
+            elif self.source_type == SourceType.GITHUB:
+                # Get file content from GitHub using Contents API
+                encoded_path = urllib.parse.quote(file_info['path'])
+                content_url = f"https://api.github.com/repos/{organization}/{repository.name}/contents/{encoded_path}?ref={repository.default_branch}"
+                
+                req = urllib.request.Request(content_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=UTMSConfig.API_TIMEOUT_SECONDS) as response:
+                    if response.status == 200:
+                        import json
+                        data = json.loads(response.read().decode('utf-8'))
+                        # GitHub returns base64 encoded content
+                        if 'content' in data:
+                            return base64.b64decode(data['content']).decode('utf-8', errors='ignore')
         
         except Exception as e:
             logger.debug(f"Error getting file content for {file_info['path']}: {e}")
         
         return None
     
-    def _get_file_content_streaming(self, repository: Repository, file_info: dict, organization: str, token: str) -> Optional[str]:
+    def _get_file_content_streaming(self, repository: Repository, file_info: dict, organization: str, headers: Dict[str, str]) -> Optional[str]:
         """Get file content using streaming (for larger files)."""
-        headers = self.auth_manager.get_headers(self.source_type, token)
         
         try:
             if self.source_type == SourceType.AZURE_DEVOPS:
-                import urllib.parse
                 encoded_path = urllib.parse.quote(file_info['path'])
                 content_url = f"https://dev.azure.com/{organization}/{repository.project_id}/_apis/git/repositories/{repository.id}/items?path={encoded_path}&$format=text&api-version=6.0"
                 
-                import urllib.request
                 req = urllib.request.Request(content_url, headers=headers)
                 
                 content_chunks = []
                 with urllib.request.urlopen(req, timeout=UTMSConfig.API_TIMEOUT_SECONDS) as response:
-                    if response.status == UTMSConfig.HTTP_OK:
+                    if response.status == 200:
+                        # Stream content in chunks
+                        while True:
+                            chunk = response.read(UTMSConfig.STREAM_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            content_chunks.append(chunk)
+                        
+                        # Decode all chunks together
+                        return b''.join(content_chunks).decode('utf-8', errors='ignore')
+            
+            elif self.source_type == SourceType.GITHUB:
+                # For larger files, use raw content URL which doesn't require base64 decoding
+                encoded_path = urllib.parse.quote(file_info['path'])
+                content_url = f"https://raw.githubusercontent.com/{organization}/{repository.name}/{repository.default_branch}/{encoded_path}"
+                
+                req = urllib.request.Request(content_url, headers=headers)
+                
+                content_chunks = []
+                with urllib.request.urlopen(req, timeout=UTMSConfig.API_TIMEOUT_SECONDS) as response:
+                    if response.status == 200:
                         # Stream content in chunks
                         while True:
                             chunk = response.read(UTMSConfig.STREAM_CHUNK_SIZE)
@@ -1397,235 +989,57 @@ class RepositoryScanner(BaseAPIClient):
             logger.debug(f"Error streaming file content for {file_info['path']}: {e}")
         
         return None
-    
-    def _make_api_request(self, url: str, headers: dict) -> dict:
-        """Make an authenticated API request."""
-        import urllib.request
-        import urllib.error
-        import json
-        
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=UTMSConfig.API_TIMEOUT_SECONDS) as response:
-                if response.status == UTMSConfig.HTTP_OK:
-                    return json.loads(response.read().decode())
-                else:
-                    raise Exception(f"API request failed with status {response.status}")
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode() if e.fp else "No error details"
-            raise Exception(f"HTTP {e.code}: {error_body}")
-        except Exception as e:
-            raise Exception(f"API request failed: {e}")
-
-
-class AuthenticationProvider(ABC):
-    """Abstract base class for authentication providers."""
-    
-    @abstractmethod
-    def get_token(self) -> Optional[str]:
-        """Get authentication token."""
-        pass
-    
-    @abstractmethod 
-    def get_name(self) -> str:
-        """Get provider name for logging."""
-        pass
-
-
-class EnvironmentAuthProvider(AuthenticationProvider):
-    """Get token from environment variables."""
-    
-    def __init__(self, env_var_names: List[str]):
-        self.env_var_names = env_var_names
-    
-    def get_token(self) -> Optional[str]:
-        """Check environment variables for token."""
-        for env_var in self.env_var_names:
-            token = os.getenv(env_var)
-            if token and token.strip():
-                logger.debug(f"Found token in environment variable: {env_var}")
-                return token.strip()
-        return None
-    
-    def get_name(self) -> str:
-        """Get provider name."""
-        return "environment variables"
-
-
-class KeychainAuthProvider(AuthenticationProvider):
-    """Get token from macOS Keychain."""
-    
-    def __init__(self, service_name: str, account_name: str):
-        self.service_name = service_name
-        self.account_name = account_name
-    
-    def get_token(self) -> Optional[str]:
-        """Retrieve token from macOS Keychain."""
-        try:
-            import subprocess
-            result = subprocess.run([
-                'security', 'find-generic-password',
-                '-s', self.service_name,
-                '-a', self.account_name,
-                '-w'
-            ], capture_output=True, text=True, check=True, timeout=UTMSConfig.TOKEN_VALIDATION_TIMEOUT)
-            
-            token = result.stdout.strip()
-            if token:
-                logger.debug(f"Found token in keychain: {self.service_name}")
-                return token
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-            logger.debug(f"Could not retrieve token from keychain: {self.service_name}")
-        except Exception as e:
-            logger.debug(f"Keychain access failed: {e}")
-        return None
-    
-    def get_name(self) -> str:
-        """Get provider name."""
-        return "macOS Keychain"
-
-
-class InteractiveAuthProvider(AuthenticationProvider):
-    """Get token through interactive prompt."""
-    
-    def __init__(self, service_name: str, organization: str = ""):
-        self.service_name = service_name
-        self.organization = organization
-    
-    def get_token(self) -> Optional[str]:
-        """Prompt user for token securely."""
-        safe_print(f"\n🔐 {self.service_name} authentication required.")
-        if self.organization:
-            safe_print(f"   Organization: {self.organization}")
-        self._show_instructions()
-        safe_print()
-        
-        try:
-            import getpass
-            token = getpass.getpass(f"Enter your {self.service_name} PAT: ").strip()
-            if not token:
-                logger.warning("No token provided")
-                return None
-            
-            # Offer to save to keychain on macOS
-            if sys.platform == 'darwin' and self.organization:
-                self._offer_keychain_save(token)
-            
-            return token
-        except KeyboardInterrupt:
-            safe_print("\n❌ Authentication cancelled by user")
-            return None
-        except Exception as e:
-            logger.error(f"Error during interactive authentication: {e}")
-            return None
-    
-    def _show_instructions(self):
-        """Show service-specific instructions."""
-        # Override in subclasses for specific instructions
-        safe_print("   Please provide your Personal Access Token (PAT)")
-    
-    def _offer_keychain_save(self, token: str):
-        """Offer to save token to keychain."""
-        # Override in subclasses for specific keychain handling
-        pass
-    
-    def get_name(self) -> str:
-        """Get provider name."""
-        return "interactive prompt"
-
-
-# Source-specific Authentication Providers
-
-class AzureDevOpsInteractiveAuthProvider(InteractiveAuthProvider):
-    """Azure DevOps specific interactive authentication."""
-    
-    def __init__(self, organization: str):
-        super().__init__("Azure DevOps", organization)
-        self.organization = organization
-    
-    def _show_instructions(self):
-        """Show Azure DevOps specific instructions."""
-        safe_print("   Create a PAT at: https://dev.azure.com/_usersSettings/tokens")
-        safe_print("   Required scopes: Code (read)")
-    
-    def _offer_keychain_save(self, token: str):
-        """Offer to save Azure DevOps token to keychain."""
-        try:
-            response = input("\n💾 Save token to macOS Keychain for future use? (y/N): ").strip().lower()
-            if response in ['y', 'yes']:
-                import subprocess
-                subprocess.run([
-                    'security', 'add-generic-password',
-                    '-s', f'azure-devops-{self.organization}',
-                    '-a', 'personal-access-token',
-                    '-w', token,
-                    UTMSConfig.KEYCHAIN_UPDATE_FLAG  # Update if exists
-                ], capture_output=True, check=True)
-                safe_print("✅ Token saved to keychain")
-        except Exception as e:
-            logger.debug(f"Could not save to keychain: {e}")
 
 
 class AuthenticationManager:
-    """Manages authentication across different source types."""
+    """Simple PAT-based authentication manager."""
     
-    def __init__(self):
-        self.auth_providers = {}
-        self._setup_providers()
-    
-    def _setup_providers(self):
-        """Set up authentication providers for each source type."""
-        # Azure DevOps providers
-        self.auth_providers[SourceType.AZURE_DEVOPS] = [
-            EnvironmentAuthProvider(['AZURE_DEVOPS_PAT', 'AZURE_PAT', 'ADO_PAT']),
-            # Keychain provider will be added dynamically per organization
-        ]
-    
-    def authenticate(self, source_type: SourceType, organization: str = "") -> Optional[str]:
-        """Authenticate for a specific source type and organization."""
-        if source_type not in self.auth_providers:
-            logger.error(f"Unsupported source type: {source_type}")
-            return None
+    def authenticate(self, source_type: SourceType, organization: str = "", token: str = None) -> Optional[str]:
+        """
+        Get authentication token from --token flag or environment variables.
         
-        # Create dynamic provider list for this organization
-        providers = self.auth_providers[source_type].copy()
+        Priority:
+        1. --token command line argument
+        2. Environment variables (AZURE_DEVOPS_PAT, GITHUB_TOKEN, etc.)
+        3. Fail with clear error message
+        """
+        # If token provided via CLI, use it
+        if token:
+            if self._validate_token(source_type, token, organization):
+                logger.debug(f"Using token from --token argument")
+                return token
+            else:
+                logger.error("Token validation failed")
+                return None
         
-        # Add organization-specific keychain provider
-        if source_type == SourceType.AZURE_DEVOPS and organization:
-            keychain_provider = KeychainAuthProvider(
-                f'azure-devops-{organization}',
-                'personal-access-token'
-            )
-            providers.append(keychain_provider)
+        # Try environment variables
+        env_vars = self._get_env_var_names(source_type)
+        for env_var in env_vars:
+            env_token = os.getenv(env_var)
+            if env_token and env_token.strip():
+                if self._validate_token(source_type, env_token.strip(), organization):
+                    logger.debug(f"Using token from environment variable: {env_var}")
+                    return env_token.strip()
         
-        # Add interactive provider as fallback
-        if source_type == SourceType.AZURE_DEVOPS:
-            interactive_provider = AzureDevOpsInteractiveAuthProvider(organization)
-            providers.append(interactive_provider)
-        
-        # Try each provider in sequence
-        for provider in providers:
-            try:
-                logger.debug(f"Trying authentication via {provider.get_name()}")
-                token = provider.get_token()
-                if token:
-                    if self._validate_token(source_type, token, organization):
-                        logger.info(f"✅ Authenticated via {provider.get_name()}")
-                        return token
-                    else:
-                        logger.warning(f"❌ Invalid token from {provider.get_name()}")
-            except Exception as e:
-                logger.debug(f"Authentication provider {provider.get_name()} failed: {e}")
-        
-        logger.error(f"❌ Authentication failed for {source_type.value}")
+        # No token found
+        logger.error(f"No authentication token provided")
         return None
+    
+    def _get_env_var_names(self, source_type: SourceType) -> List[str]:
+        """Get list of environment variable names to check for this source type."""
+        if source_type == SourceType.AZURE_DEVOPS:
+            return ['AZURE_DEVOPS_PAT', 'AZURE_PAT', 'ADO_PAT']
+        if source_type == SourceType.GITHUB:
+            return ['GITHUB_TOKEN', 'GH_TOKEN']
+        return []
     
     def _validate_token(self, source_type: SourceType, token: str, organization: str = "") -> bool:
         """Validate token by making a test API call."""
         try:
             if source_type == SourceType.AZURE_DEVOPS:
                 return self._validate_azure_devops_token(token, organization)
-            # Add other source types here
+            if source_type == SourceType.GITHUB:
+                return self._validate_github_token(token)
             return False
         except Exception as e:
             logger.debug(f"Token validation failed: {e}")
@@ -1633,58 +1047,299 @@ class AuthenticationManager:
     
     def _validate_azure_devops_token(self, token: str, organization: str) -> bool:
         """Validate Azure DevOps token."""
-        import urllib.request
-        import urllib.error
-        import base64
-        
         try:
-            # Encode token for basic auth
-            auth_string = base64.b64encode(f':{token}'.encode()).decode()
-            
-            # Test API call to list projects
             url = f'https://dev.azure.com/{organization}/_apis/projects?api-version=6.0'
+            headers = self.get_headers(SourceType.AZURE_DEVOPS, token)
             req = urllib.request.Request(url)
-            req.add_header('Authorization', f'Basic {auth_string}')
-            req.add_header('Accept', 'application/json')
+            for key, value in headers.items():
+                req.add_header(key, value)
             
             with urllib.request.urlopen(req, timeout=UTMSConfig.TOKEN_VALIDATION_TIMEOUT) as response:
-                if response.status == UTMSConfig.HTTP_OK:
-                    import json
-                    data = json.loads(response.read().decode())
-                    project_count = data.get('count', 0)
-                    logger.debug(f"Token validation successful - found {project_count} projects")
-                    return True
+                return response.status == 200
+        except (urllib.error.HTTPError, Exception) as e:
+            logger.debug(f"Token validation error: {e}")
             return False
-        except urllib.error.HTTPError as e:
-            logger.debug(f"HTTP error during token validation: {e.code}")
-            return False
-        except Exception as e:
+    
+    def _validate_github_token(self, token: str) -> bool:
+        """Validate GitHub token."""
+        try:
+            url = 'https://api.github.com/user'
+            headers = self.get_headers(SourceType.GITHUB, token)
+            req = urllib.request.Request(url)
+            for key, value in headers.items():
+                req.add_header(key, value)
+            
+            with urllib.request.urlopen(req, timeout=UTMSConfig.TOKEN_VALIDATION_TIMEOUT) as response:
+                return response.status == 200
+        except (urllib.error.HTTPError, Exception) as e:
             logger.debug(f"Token validation error: {e}")
             return False
     
     def get_headers(self, source_type: SourceType, token: str) -> Dict[str, str]:
         """Get HTTP headers for API requests."""
         if source_type == SourceType.AZURE_DEVOPS:
-            import base64
             auth_string = base64.b64encode(f':{token}'.encode()).decode()
             return {
                 'Authorization': f'Basic {auth_string}',
                 'Accept': 'application/json'
             }
-        # Add other source types here
+        if source_type == SourceType.GITHUB:
+            return {
+                'Authorization': f'Bearer {token}',
+                'Accept': 'application/vnd.github+json'
+            }
         return {}
-    
-    def get_token(self, source_type: SourceType = None, organization: str = "") -> Optional[str]:
-        """
-        Compatibility method that wraps authenticate().
-        This method is kept for backward compatibility with existing code.
-        """
-        if source_type is None:
-            source_type = SourceType.AZURE_DEVOPS  # Default fallback
-        return self.authenticate(source_type, organization)
 
 
 # Output Management and Results Storage
+
+class GitModuleVersionChecker:
+    """Checks for outdated Git module versions."""
+    
+    def __init__(self, auth_manager: 'AuthenticationManager'):
+        self.auth_manager = auth_manager
+        self._version_cache = {}  # Cache to avoid duplicate API calls
+        self._github_token = None
+        self._azure_token = None
+    
+    def set_tokens(self, azure_token: Optional[str] = None, github_token: Optional[str] = None):
+        """Set authentication tokens for checking module versions."""
+        self._azure_token = azure_token
+        self._github_token = github_token
+    
+    def check_module_version(self, module: ModuleReference) -> tuple[Optional[str], Optional[bool]]:
+        """Check if a Git module is outdated. Returns (latest_version, is_outdated)."""
+        if module.source_type != ModuleSourceType.GIT:
+            return None, None
+        
+        try:
+            git_info = self._parse_git_url(module.source)
+            if not git_info:
+                return None, None
+            
+            # Get the appropriate token for this repository type
+            token = self._get_token_for_git_type(git_info['type'])
+            # Note: token can be None for public repositories
+            
+            # Get latest version from the source repository
+            latest_version = self._get_latest_version(git_info, token)
+            if not latest_version:
+                return None, None
+            
+            # Compare versions if module has a version specified
+            is_outdated = None
+            if module.version:
+                is_outdated = self._compare_versions(module.version, latest_version)
+            
+            return latest_version, is_outdated
+            
+        except Exception as e:
+            logger.debug(f"Could not check version for {module.source}: {e}")
+            return None, None
+    
+    def _get_token_for_git_type(self, git_type: str) -> Optional[str]:
+        """Get the appropriate token for a Git repository type."""
+        if git_type == 'github':
+            return self._github_token
+        elif git_type == 'azure-devops':
+            return self._azure_token
+        return None
+    
+    def _parse_git_url(self, source: str) -> Optional[dict]:
+        """Parse Git URL to extract host, org, and repo."""
+        try:
+            # Handle git:: prefix
+            url = source.replace('git::', '')
+            
+            # Remove query parameters (e.g., ?ref=v1.0.0)
+            if '?' in url:
+                url = url.split('?')[0]
+            
+            # Remove .git suffix
+            url = url.rstrip('.git')
+            
+            # GitHub patterns
+            github_patterns = [
+                r'https?://github\.com/([^/]+)/([^/]+)',
+                r'git@github\.com:([^/]+)/([^/]+)',
+                r'ssh://git@github\.com/([^/]+)/([^/]+)'
+            ]
+            
+            for pattern in github_patterns:
+                match = re.match(pattern, url)
+                if match:
+                    return {
+                        'type': 'github',
+                        'org': match.group(1),
+                        'repo': match.group(2)
+                    }
+            
+            # Azure DevOps patterns
+            # https://dev.azure.com/org/project/_git/repo
+            # https://org@dev.azure.com/org/project/_git/repo
+            ado_pattern = r'https?://.*dev\.azure\.com/([^/]+)/([^/]+)/_git/([^/]+)'
+            match = re.match(ado_pattern, url)
+            if match:
+                return {
+                    'type': 'azure-devops',
+                    'org': match.group(1),
+                    'project': match.group(2),
+                    'repo': match.group(3)
+                }
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Could not parse Git URL {source}: {e}")
+            return None
+    
+    def _get_latest_version(self, git_info: dict, token: str) -> Optional[str]:
+        """Get the latest version/tag from the Git repository."""
+        cache_key = f"{git_info['type']}:{git_info['org']}:{git_info.get('project', '')}:{git_info['repo']}"
+        
+        # Check cache first
+        if cache_key in self._version_cache:
+            return self._version_cache[cache_key]
+        
+        try:
+            if git_info['type'] == 'github':
+                latest = self._get_github_latest_version(git_info['org'], git_info['repo'], token)
+            elif git_info['type'] == 'azure-devops':
+                latest = self._get_azure_devops_latest_version(
+                    git_info['org'], git_info['project'], git_info['repo'], token
+                )
+            else:
+                return None
+            
+            # Cache the result
+            self._version_cache[cache_key] = latest
+            return latest
+            
+        except Exception as e:
+            logger.debug(f"Could not get latest version for {cache_key}: {e}")
+            return None
+    
+    def _get_github_latest_version(self, org: str, repo: str, token: Optional[str]) -> Optional[str]:
+        """Get latest release or tag from GitHub."""
+        try:
+            # Build headers - works with or without token
+            if token:
+                headers = self.auth_manager.get_headers(SourceType.GITHUB, token)
+            else:
+                headers = {'Accept': 'application/vnd.github+json'}
+            
+            # Try latest release first
+            url = f'https://api.github.com/repos/{org}/{repo}/releases/latest'
+            req = urllib.request.Request(url, headers=headers)
+            
+            try:
+                with urllib.request.urlopen(req, timeout=UTMSConfig.API_TIMEOUT_SECONDS) as response:
+                    if response.status == 200:
+                        data = json.loads(response.read().decode())
+                        return data.get('tag_name')
+            except urllib.error.HTTPError as e:
+                # No releases or auth required, try tags
+                if e.code == 404:
+                    pass  # No releases, will try tags
+                elif e.code == 401:
+                    logger.debug(f"GitHub auth required for {org}/{repo} (private repository)")
+                    return None
+                else:
+                    pass  # Try tags anyway
+            
+            # Fall back to latest tag
+            url = f'https://api.github.com/repos/{org}/{repo}/tags'
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=UTMSConfig.API_TIMEOUT_SECONDS) as response:
+                if response.status == 200:
+                    tags = json.loads(response.read().decode())
+                    if tags and len(tags) > 0:
+                        return tags[0]['name']
+            
+            return None
+            
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                logger.debug(f"GitHub auth required for {org}/{repo} (private repository)")
+            else:
+                logger.debug(f"GitHub version check failed for {org}/{repo}: HTTP {e.code}")
+            return None
+        except Exception as e:
+            logger.debug(f"GitHub version check failed for {org}/{repo}: {e}")
+            return None
+    
+    def _get_azure_devops_latest_version(self, org: str, project: str, repo: str, token: str) -> Optional[str]:
+        """Get latest tag from Azure DevOps."""
+        try:
+            headers = self.auth_manager.get_headers(SourceType.AZURE_DEVOPS, token)
+            
+            # Get tags (refs/tags/*)
+            url = f'https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/refs?filter=tags&api-version=6.0'
+            req = urllib.request.Request(url, headers=headers)
+            
+            with urllib.request.urlopen(req, timeout=UTMSConfig.API_TIMEOUT_SECONDS) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode())
+                    refs = data.get('value', [])
+                    
+                    # Extract version tags and sort
+                    version_tags = []
+                    for ref in refs:
+                        name = ref.get('name', '')
+                        if name.startswith('refs/tags/'):
+                            tag = name.replace('refs/tags/', '')
+                            version_tags.append(tag)
+                    
+                    if version_tags:
+                        # Sort versions (simple sorting, semantic version aware)
+                        version_tags.sort(key=lambda v: self._version_sort_key(v), reverse=True)
+                        return version_tags[0]
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Azure DevOps version check failed for {org}/{project}/{repo}: {e}")
+            return None
+    
+    def _compare_versions(self, current: str, latest: str) -> bool:
+        """Compare versions and return True if current is outdated."""
+        # Clean version strings
+        current_clean = current.lstrip('vV').strip()
+        latest_clean = latest.lstrip('vV').strip()
+        
+        # If they're the same, not outdated
+        if current_clean == latest_clean:
+            return False
+        
+        # Try semantic version comparison
+        try:
+            current_parts = [int(x) for x in current_clean.split('.')]
+            latest_parts = [int(x) for x in latest_clean.split('.')]
+            
+            # Pad to same length
+            max_len = max(len(current_parts), len(latest_parts))
+            current_parts += [0] * (max_len - len(current_parts))
+            latest_parts += [0] * (max_len - len(latest_parts))
+            
+            # Compare
+            return current_parts < latest_parts
+            
+        except (ValueError, AttributeError):
+            # Fall back to string comparison
+            return current_clean < latest_clean
+    
+    def _version_sort_key(self, version: str) -> tuple:
+        """Create a sort key for version strings."""
+        try:
+            # Remove 'v' or 'V' prefix
+            clean = version.lstrip('vV')
+            # Split into numeric parts
+            parts = [int(x) for x in clean.split('.')]
+            return tuple(parts)
+        except (ValueError, AttributeError):
+            # Fall back to string sorting
+            return (0, 0, 0)
+
 
 class ResultsManager:
     """Manages scanning results output and storage."""
@@ -1695,210 +1350,73 @@ class ResultsManager:
     
     def _ensure_output_directory(self):
         """Create output directory if it doesn't exist."""
-        import os
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
             logger.info(f"📁 Created output directory: {self.output_dir}")
     
-    def save_scan_results(self, organization: str, source_type: SourceType, all_results: List[ScanResult], summary: 'ScanSummary', tmvs_directory: str = None) -> str:
-        """
-        Save scan results to JSON file.
-        
-        Args:
-            organization: Organization name
-            source_type: Source type (azure-devops, github)
-            all_results: List of all scan results
-            summary: Scan summary
-            tmvs_directory: Optional path to TMVS results for enrichment
-            
-        Returns:
-            Path to the saved file
-            
-        Raises:
-            OSError: If file cannot be written
-            json.JSONEncodeError: If data cannot be serialized
-        """
-        # Load TMVS data for enrichment if provided
-        tmvs_data = self._load_tmvs_data_for_enrichment(tmvs_directory)
-        
-        # Prepare output data structure
-        output_data = self._build_output_data_structure(organization, source_type, summary, tmvs_data)
-        
-        # Add detailed results for each repository
-        self._add_detailed_repository_results(output_data, all_results, tmvs_data)
-        
-        # Calculate version status counts from enriched data
-        self._calculate_version_status_counts(output_data, summary)
+    def save_scan_results(self, result: ScanResult, organization: str, project: str, repository: str, source_type: SourceType, filters: list = None) -> str:
+        """Save scan results to JSON file and return filepath."""
+        # Build output with metadata
+        output_data = self._build_output_with_metadata(result, organization, project, repository, source_type, filters)
         
         # Save to file
-        return self._save_output_data_to_file(output_data, organization)
+        return self._save_output_data_to_file(output_data, organization, project, repository)
     
-    def _load_tmvs_data_for_enrichment(self, tmvs_directory: str) -> dict:
-        """Load TMVS data for enrichment if provided."""
-        tmvs_data = {}
-        if tmvs_directory:
-            try:
-                tmvs_data = self._load_tmvs_data(tmvs_directory)
-            except Exception as e:
-                logger.warning(f"Failed to load TMVS data from {tmvs_directory}: {e}")
-        return tmvs_data
-    
-    def _build_output_data_structure(self, organization: str, source_type: SourceType, summary: 'ScanSummary', tmvs_data: dict) -> dict:
-        """Build the main output data structure."""
+    def _build_output_with_metadata(self, result: ScanResult, organization: str, project: str, repository: str, source_type: SourceType, filters: list = None) -> dict:
+        """Build output with repository metadata and modules."""
+        modules = self._build_simple_output(result, filters)
+        
         return {
-            "scan_metadata": {
+            "metadata": {
                 "organization": organization,
+                "project": project if source_type == SourceType.AZURE_DEVOPS else None,
+                "repository": repository,
                 "source_type": source_type.value,
-                "scan_timestamp": summary.scan_timestamp,
-                "utms_version": __version__,
-                "total_repositories": summary.total_repositories,
-                "total_files_scanned": summary.total_files_scanned,
-                "total_modules_found": summary.total_modules_found,
-                "total_registry_modules": summary.total_registry_modules,
-                "projects_scanned": summary.projects_scanned,
-                "tmvs_enriched": bool(tmvs_data)
+                "scan_timestamp": result.scan_timestamp,
+                "total_modules_found": len(modules) if filters else result.total_modules_found,
+                "total_files_scanned": result.total_files_scanned
             },
-            "summary_statistics": {
-                "modules_by_registry": summary.modules_by_registry,
-                "modules_by_provider": summary.modules_by_provider,
-                "modules_by_namespace": summary.modules_by_namespace,
-                "version_constraints_used": summary.version_constraints_used,
-                "version_status_counts": summary.version_status_counts,
-                "repositories_with_modules": summary.repositories_with_modules
-            },
-            "detailed_results": []
+            "modules": modules
         }
     
-    def _add_detailed_repository_results(self, output_data: dict, all_results: List[ScanResult], tmvs_data: dict) -> None:
-        """Add detailed results for each repository."""
-        for result in all_results:
-            repo_data = self._build_repository_data(result)
-            self._add_module_data_to_repository(repo_data, result, tmvs_data)
-            
-            if result.modules:  # Only include repositories that have modules
-                output_data["detailed_results"].append(repo_data)
-    
-    def _build_repository_data(self, result: ScanResult) -> dict:
-        """Build repository data structure."""
-        return {
-            "repository": {
-                "name": result.repository_name,
-                "project": result.project_name,
-                "full_name": f"{result.project_name}/{result.repository_name}" if result.project_name else result.repository_name
-            },
-            "scan_results": {
-                "files_scanned": result.total_files_scanned,
-                "modules_found": result.total_modules_found,
-                "registry_modules_found": result.registry_modules_found,
-                "scan_timestamp": result.scan_timestamp
-            },
-            "modules": []
-        }
-    
-    def _add_module_data_to_repository(self, repo_data: dict, result: ScanResult, tmvs_data: dict) -> None:
-        """Add module details to repository data."""
-        for module in result.modules:
-            module_data = self._build_module_data(module)
-            self._enrich_module_with_tmvs_data(module_data, module, tmvs_data)
-            repo_data["modules"].append(module_data)
-    
-    def _build_module_data(self, module) -> dict:
-        """Build basic module data structure."""
-        return {
-            "source": module.source,
-            "local_name": module.local_name,
-            "version": module.version,
-            "registry_hostname": module.registry_hostname,
-            "namespace": module.namespace,
-            "name": module.name,
-            "provider": module.provider,
-            "file_path": module.file_path,
-            "line_number": module.line_number
-        }
-    
-    def _enrich_module_with_tmvs_data(self, module_data: dict, module, tmvs_data: dict) -> None:
-        """Enrich module data with TMVS information if available."""
-        if tmvs_data:
-            tmvs_key = f"{module.namespace}/{module.name}/{module.provider}"
-            if tmvs_key in tmvs_data:
-                tmvs_module = tmvs_data[tmvs_key]
-                module_data["latest_version"] = tmvs_module.get("latest_version")
+    def _build_simple_output(self, result: ScanResult, filters: list = None) -> list:
+        """Build simple output - just a list of modules with optional filtering."""
+        modules = result.modules
+        
+        # Apply filters if specified
+        if filters:
+            filtered = []
+            for module in modules:
+                include = False
                 
-                # Resolve version constraint if we have a version
-                if module.version:
-                    constraint_resolution = VersionConstraintResolver.resolve_constraint(
-                        module.version, 
-                        tmvs_module.get("all_versions", [])
-                    )
-                    module_data["resolved_version"] = constraint_resolution.get("latest_matching")
-                else:
-                    module_data["resolved_version"] = None
+                # Check if module matches any filter criteria
+                if "outdated" in filters and module.is_outdated is True:
+                    include = True
+                if "local" in filters and module.source_type == ModuleSourceType.LOCAL:
+                    include = True
                 
-                # Add version status indicator
-                module_data["version_status"] = self._calculate_version_status(
-                    module_data.get("resolved_version"), 
-                    module_data.get("latest_version")
-                )
-            else:
-                module_data["latest_version"] = None
-                module_data["resolved_version"] = None
-                module_data["version_status"] = "unknown"
-    
-    def _calculate_version_status_counts(self, output_data: dict, summary: 'ScanSummary') -> None:
-        """Calculate version status counts from enriched module data."""
-        version_status_counts = {}
-        
-        for repo_result in output_data.get("detailed_results", []):
-            for module in repo_result.get("modules", []):
-                status = module.get("version_status", "unknown")
-                version_status_counts[status] = version_status_counts.get(status, 0) + 1
-        
-        # Update both the output data and summary
-        output_data["summary_statistics"]["version_status_counts"] = version_status_counts
-        summary.version_status_counts = version_status_counts
-    
-    def _calculate_version_status(self, resolved_version: str, latest_version: str) -> str:
-        """
-        Calculate version status indicator based on major version difference.
-        
-        Args:
-            resolved_version: The version resolved from constraint
-            latest_version: The latest available version
+                if include:
+                    filtered.append(module)
             
-        Returns:
-            - "current" (🟢): resolved and latest have same major version
-            - "outdated" (🟠): resolved is 1 major version behind
-            - "critical" (🔴): resolved is 2+ major versions behind
-            - "unknown" (⚪): versions unavailable or unparseable
-        """
-        if not resolved_version or not latest_version:
-            return "unknown"
+            modules = filtered
         
-        try:
-            # Parse both versions using the existing version parser
-            resolved_major, _, _ = VersionConstraintResolver.parse_version(resolved_version)
-            latest_major, _, _ = VersionConstraintResolver.parse_version(latest_version)
-            
-            major_diff = latest_major - resolved_major
-            
-            if major_diff == 0:
-                return "current"    # 🟢 Same major version
-            elif major_diff == 1:
-                return "outdated"   # 🟠 One major version behind
-            else:
-                return "critical"   # 🔴 Two or more major versions behind
-                
-        except (ValueError, TypeError):
-            # If version parsing fails, return unknown
-            return "unknown"
+        return [
+            {
+                "file_path": module.file_path,
+                "local_name": module.local_name,
+                "source": module.source,
+                "source_type": module.source_type.value,
+                "version": module.version,
+                "latest_version": module.latest_version,
+                "is_outdated": module.is_outdated
+            }
+            for module in modules
+        ]
     
-    def _save_output_data_to_file(self, output_data: dict, organization: str) -> str:
+    def _save_output_data_to_file(self, output_data: dict, organization: str, project: str, repository: str) -> str:
         """Save output data to JSON file."""
-        import json
-        import os
-        
-        # Simple filename format: just the organization name (like TMVS uses provider name)
-        filename = f"{organization.lower()}.json"
+        # Filename format: org-project-repo.json
+        filename = f"{organization.lower()}-{project.lower()}-{repository.lower()}.json"
         filepath = os.path.join(self.output_dir, filename)
         
         try:
@@ -1914,406 +1432,92 @@ class ResultsManager:
         logger.info(f"💾 Results saved to: {filepath}")
         return filepath
     
-    def _load_tmvs_data(self, tmvs_directory: str) -> dict:
-        """
-        Load TMVS data files for enrichment.
+    def clean_specific_result(self, organization: str, project: str, repository: str):
+        """Clean existing result file for a specific repository."""
+        filename = f"{organization.lower()}-{project.lower()}-{repository.lower()}.json"
+        filepath = os.path.join(self.output_dir, filename)
         
-        Args:
-            tmvs_directory: Directory containing TMVS JSON files
-            
-        Returns:
-            Dictionary mapping module keys to module data
-            
-        Raises:
-            OSError: If directory cannot be accessed
-        """
-        import json
-        import os
-        import glob
-        
-        tmvs_data = {}
-        tmvs_files = glob.glob(os.path.join(tmvs_directory, "*.json"))
-        
-        for tmvs_file in tmvs_files:
+        if os.path.exists(filepath):
             try:
-                with open(tmvs_file, 'r', encoding='utf-8') as f:
-                    provider_data = json.load(f)
-                    provider = provider_data.get('provider', os.path.splitext(os.path.basename(tmvs_file))[0])
-                    
-                    # Index modules by namespace/name/provider for quick lookup
-                    for module in provider_data.get('modules', []):
-                        key = f"{module.get('namespace', '')}/{module.get('name', '')}/{provider}"
-                        tmvs_data[key] = module
-                        
-            except Exception as e:
-                logger.warning(f"Could not load TMVS file {tmvs_file}: {e}")
-        
-        if tmvs_data:
-            logger.info(f"📊 Loaded {len(tmvs_data)} modules from {len(tmvs_files)} TMVS files for enrichment")
-        
-        return tmvs_data
-    
-    def clean_existing_results(self, organization: str, source_type: SourceType):
-        """Clean existing result files for the organization/source."""
-        import os
-        import glob
-        
-        pattern = os.path.join(self.output_dir, f"{organization}_{source_type.value}_*.json")
-        existing_files = glob.glob(pattern)
-        
-        for file_path in existing_files:
-            try:
-                os.remove(file_path)
-                logger.debug(f"🗑️ Removed existing file: {os.path.basename(file_path)}")
-            except Exception as e:
-                logger.warning(f"Could not remove {file_path}: {e}")
-        
-        if existing_files:
-            logger.info(f"🧹 Cleaned {len(existing_files)} existing result files")
-    
-    def cross_reference_with_tmvs(self, utms_results_path: str, tmvs_results_dir: str, output_path: str = None) -> str:
-        """
-        Cross-reference UTMS results with TMVS registry data to resolve version constraints.
-        
-        Args:
-            utms_results_path: Path to UTMS JSON results file
-            tmvs_results_dir: Directory containing TMVS JSON files
-            output_path: Optional output path for cross-reference results
-            
-        Returns:
-            Path to the cross-reference results file
-        """
-        # Load and validate input data
-        utms_data = self._load_utms_results(utms_results_path)
-        tmvs_data = self._load_tmvs_data(tmvs_results_dir)
-        
-        # Perform cross-reference analysis
-        cross_reference_results = self._perform_cross_reference_analysis(utms_data, tmvs_data, utms_results_path, tmvs_results_dir)
-        
-        # Save and report results
-        output_file = self._save_cross_reference_results(cross_reference_results, output_path, utms_data)
-        self._print_cross_reference_summary(cross_reference_results, output_file)
-        
-        return output_file
-    
-    def _load_utms_results(self, utms_results_path: str) -> dict:
-        """Load UTMS results from JSON file."""
-        import json
-        try:
-            with open(utms_results_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            raise ValueError(f"Could not load UTMS results from {utms_results_path}: {e}")
-    
-    def _load_tmvs_data(self, tmvs_results_dir: str) -> dict:
-        """Load and index all TMVS data from directory."""
-        import json
-        import os
-        import glob
-        
-        tmvs_data = {}
-        tmvs_files = glob.glob(os.path.join(tmvs_results_dir, "*.json"))
-        
-        if not tmvs_files:
-            raise ValueError(f"No TMVS JSON files found in {tmvs_results_dir}")
-        
-        for tmvs_file in tmvs_files:
-            try:
-                with open(tmvs_file, 'r', encoding='utf-8') as f:
-                    provider_data = json.load(f)
-                    provider = provider_data.get('provider', os.path.splitext(os.path.basename(tmvs_file))[0])
-                    
-                    # Index modules by namespace/name for quick lookup
-                    for module in provider_data.get('modules', []):
-                        key = f"{module.get('namespace', '')}/{module.get('name', '')}/{provider}"
-                        tmvs_data[key] = module
-                        
-            except Exception as e:
-                logger.warning(f"Could not load TMVS file {tmvs_file}: {e}")
-        
-        logger.info(f"📊 Loaded {len(tmvs_data)} modules from {len(tmvs_files)} TMVS files")
-        return tmvs_data
-    
-    def _perform_cross_reference_analysis(self, utms_data: dict, tmvs_data: dict, utms_results_path: str, tmvs_results_dir: str) -> dict:
-        """Perform the actual cross-reference analysis between UTMS and TMVS data."""
-        cross_reference_results = {
-            "metadata": {
-                "utms_file": utms_results_path,
-                "tmvs_directory": tmvs_results_dir,
-                "cross_reference_timestamp": datetime.now().isoformat(),
-                "utms_version": __version__
-            },
-            "summary": {
-                "total_modules_analyzed": 0,
-                "modules_found_in_tmvs": 0,
-                "modules_missing_from_tmvs": 0,
-                "constraint_resolutions": 0
-            },
-            "detailed_analysis": []
-        }
-        
-        # Analyze each module usage
-        for repo_result in utms_data.get('detailed_results', []):
-            repo_analysis = self._analyze_repository_modules(repo_result, tmvs_data, cross_reference_results['summary'])
-            
-            if repo_analysis['modules']:
-                cross_reference_results['detailed_analysis'].append(repo_analysis)
-        
-        return cross_reference_results
-    
-    def _analyze_repository_modules(self, repo_result: dict, tmvs_data: dict, summary: dict) -> dict:
-        """Analyze modules in a single repository."""
-        repo_analysis = {
-            "repository": repo_result['repository'],
-            "modules": []
-        }
-        
-        for module in repo_result.get('modules', []):
-            summary['total_modules_analyzed'] += 1
-            module_analysis = self._analyze_single_module(module, tmvs_data, summary)
-            repo_analysis['modules'].append(module_analysis)
-        
-        return repo_analysis
-    
-    def _analyze_single_module(self, module: dict, tmvs_data: dict, summary: dict) -> dict:
-        """Analyze a single module against TMVS data."""
-        # Create lookup key for TMVS data
-        namespace = module.get('namespace', '')
-        name = module.get('name', '')
-        provider = module.get('provider', '')
-        tmvs_key = f"{namespace}/{name}/{provider}"
-        
-        module_analysis = {
-            "utms_data": module,
-            "tmvs_data": None,
-            "constraint_resolution": None,
-            "analysis": {
-                "found_in_tmvs": False,
-                "constraint_type": "unknown",
-                "resolved_versions": [],
-                "latest_matching": None,
-                "total_matching": 0
-            }
-        }
-        
-        # Look up module in TMVS data
-        if tmvs_key in tmvs_data:
-            module_analysis['tmvs_data'] = tmvs_data[tmvs_key]
-            module_analysis['analysis']['found_in_tmvs'] = True
-            summary['modules_found_in_tmvs'] += 1
-            
-            # Resolve version constraint
-            constraint = module.get('version', '')
-            available_versions = tmvs_data[tmvs_key].get('all_versions', [])
-            
-            if constraint and available_versions:
-                resolution = VersionConstraintResolver.resolve_constraint(constraint, available_versions)
-                module_analysis['constraint_resolution'] = resolution
-                module_analysis['analysis'].update({
-                    'constraint_type': resolution['constraint_type'],
-                    'resolved_versions': resolution['resolved_versions'],
-                    'latest_matching': resolution['latest_matching'],
-                    'total_matching': resolution['total_matching']
-                })
-                summary['constraint_resolutions'] += 1
-        else:
-            summary['modules_missing_from_tmvs'] += 1
-            logger.debug(f"Module not found in TMVS: {tmvs_key}")
-        
-        return module_analysis
-    
-    def _save_cross_reference_results(self, cross_reference_results: dict, output_path: str, utms_data: dict) -> str:
-        """Save cross-reference results to file."""
-        import json
-        import os
-        
-        # Generate output path if not provided
-        if not output_path:
-            organization = utms_data.get('scan_metadata', {}).get('organization', 'unknown')
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{organization.lower()}_cross_reference_{timestamp}.json"
-            output_path = os.path.join(self.output_dir, filename)
-        
-        # Save cross-reference results
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(cross_reference_results, f, indent=2, ensure_ascii=False)
-        
-        return output_path
-    
-    def _print_cross_reference_summary(self, cross_reference_results: dict, output_file: str) -> None:
-        """Print summary of cross-reference analysis."""
-        summary = cross_reference_results['summary']
-        safe_print(f"\n🔗 Cross-Reference Analysis Complete")
-        safe_print(f"📊 Total modules analyzed: {summary['total_modules_analyzed']}")
-        safe_print(f"✅ Found in TMVS: {summary['modules_found_in_tmvs']}")
-        safe_print(f"❌ Missing from TMVS: {summary['modules_missing_from_tmvs']}")
-        safe_print(f"🎯 Constraints resolved: {summary['constraint_resolutions']}")
-        safe_print(f"💾 Results saved to: {output_file}")
-
-
-@dataclass
-class ScanSummary:
-    """Summary statistics from a complete scan operation."""
-    organization: str
-    source_type: SourceType
-    scan_timestamp: str
-    total_repositories: int = 0
-    total_files_scanned: int = 0
-    total_modules_found: int = 0
-    total_registry_modules: int = 0
-    projects_scanned: List[str] = field(default_factory=list)
-    repositories_with_modules: List[str] = field(default_factory=list)
-    modules_by_registry: dict = field(default_factory=dict)
-    modules_by_provider: dict = field(default_factory=dict)
-    modules_by_namespace: dict = field(default_factory=dict)
-    version_constraints_used: dict = field(default_factory=dict)
-    version_status_counts: dict = field(default_factory=dict)  # New field for version status tracking
-    
-    def add_scan_result(self, result: ScanResult):
-        """Add a repository scan result to the summary."""
-        self.total_files_scanned += result.total_files_scanned
-        self.total_modules_found += result.total_modules_found
-        self.total_registry_modules += result.registry_modules_found
-        
-        if result.project_name and result.project_name not in self.projects_scanned:
-            self.projects_scanned.append(result.project_name)
-        
-        if result.modules:
-            repo_full_name = f"{result.project_name}/{result.repository_name}" if result.project_name else result.repository_name
-            self.repositories_with_modules.append(repo_full_name)
-        
-        # Analyze modules for statistics
-        for module in result.modules:
-            # Count by registry
-            registry = module.registry_hostname or "registry.terraform.io"
-            self.modules_by_registry[registry] = self.modules_by_registry.get(registry, 0) + 1
-            
-            # Count by provider
-            if module.provider:
-                self.modules_by_provider[module.provider] = self.modules_by_provider.get(module.provider, 0) + 1
-            
-            # Count by namespace
-            if module.namespace:
-                self.modules_by_namespace[module.namespace] = self.modules_by_namespace.get(module.namespace, 0) + 1
-            
-            # Count version constraints
-            version_type = self._classify_version_constraint(module.version)
-            self.version_constraints_used[version_type] = self.version_constraints_used.get(version_type, 0) + 1
-    
-    def _classify_version_constraint(self, version: Optional[str]) -> str:
-        """Classify the type of version constraint used."""
-        if not version:
-            return "no_version_specified"
-        elif version.startswith("~>"):
-            return "pessimistic_constraint"
-        elif ">=" in version and "<" in version:
-            return "range_constraint"
-        elif version.startswith(">="):
-            return "minimum_version"
-        elif version.startswith(">"):
-            return "greater_than"
-        elif version.startswith("<="):
-            return "maximum_version"
-        elif version.startswith("<"):
-            return "less_than"
-        elif "." in version and not any(op in version for op in ["<", ">", "~"]):
-            return "exact_version"
-        else:
-            return "other_constraint"
+                os.remove(filepath)
+                logger.info(f"🗑️  Cleaned existing result file: {filepath}")
+                safe_print(f"🗑️  Cleaned existing result file")
+            except OSError as e:
+                logger.warning(f"Failed to clean file {filepath}: {e}")
 
 
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
-    parser = _create_argument_parser()
-    _add_required_arguments(parser)
-    _add_optional_arguments(parser)
-    _add_utility_arguments(parser)
-    
-    return parser.parse_args()
-
-def _create_argument_parser() -> argparse.ArgumentParser:
-    """Create the base argument parser with description and examples."""
-    return argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         prog="utms",
-        description=f"Universal Terraform Module Scanner (UTMS) v{__version__} - Scan source repositories for Terraform module references",
+        description="Universal Terraform Module Scanner (UTMS) - Scan source repositories for Terraform module references",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Authentication Methods (tried in order):
-  1. --token argument  
-  2. Environment variables (provider-specific)
-  3. macOS Keychain
-  4. Interactive prompt
+        epilog="""Authentication Methods (tried in order):
+  1. --token command line argument
+  2. Environment variables (AZURE_DEVOPS_PAT, GITHUB_TOKEN, etc.)
 
 Output:
-  JSON files are automatically generated for each source in the 'results/' directory.
-  Console output shows a summary of findings.
+  JSON files are automatically generated in the 'results/' directory.
+  Output contains only the modules found in the specified repository.
 
 Examples:
-  utms --source azure-devops --organization my-organization
-  utms --source github --organization my-github-org  
-  utms --source azure-devops --organization my-org --projects project1,project2
-  utms --source github --organization my-org --repositories repo1,repo2
-  utms --source azure-devops --organization my-org --clean --debug
+  utms --source azure-devops --organization my-org --project MyProject --repository my-repo --token "pat_token"
+  utms --source azure-devops --organization my-org --project Platform --repository infra-core --debug
+  utms --source azure-devops --organization my-org --project Platform --repository infra-core --clean
         """
     )
-
-def _add_required_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add required command line arguments."""
+    
+    # Required arguments
     parser.add_argument(
         "--source",
         required=True,
         choices=[e.value for e in SourceType],
         help="Source type to scan (azure-devops, github)"
     )
-    
     parser.add_argument(
         "--organization", 
         required=True,
         help="Organization name (Azure DevOps organization or GitHub organization/user)"
     )
-    
+    parser.add_argument(
+        "--project",
+        required=True,
+        help="Project name (required for single repository scanning)"
+    )
+    parser.add_argument(
+        "--repository",
+        required=True,
+        help="Repository name to scan"
+    )
     parser.add_argument(
         "--token",
         help="Authentication token (overrides auto-detection)"
     )
-
-def _add_optional_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add optional filtering and configuration arguments."""
-    parser.add_argument(
-        "--projects",
-        help="Filter by specific projects (Azure DevOps only). Use comma-separated list for multiple"
-    )
     
-    parser.add_argument(
-        "--repositories", 
-        help="Filter by specific repositories (GitHub only). Use comma-separated list for multiple"
-    )
-    
+    # Optional arguments
     parser.add_argument(
         "--clean",
         action="store_true",
-        help="Clean existing source JSON files before generating new ones"
+        help="Clean existing result files before generating new ones"
     )
-    
+    parser.add_argument(
+        "--filter",
+        action="append",
+        choices=["outdated", "local"],
+        help="Filter results (can be specified multiple times): 'outdated' for outdated Git modules, 'local' for local modules"
+    )
     parser.add_argument(
         "--debug",
         action="store_true", 
         help="Enable debug output"
     )
-
-def _add_utility_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add utility arguments like cross-reference and version."""
-    parser.add_argument(
-        "--cross-reference",
-        metavar="TMVS_DIR",
-        help="Cross-reference UTMS results with TMVS registry data from specified directory"
-    )
-    
     parser.add_argument(
         "--version",
         action="version",
-        version=f"UTMS v{__version__}"
+        version="UTMS"
     )
+    
+    return parser.parse_args()
 
 
 def initialize_application(args) -> Tuple[SourceType, AuthenticationManager, str]:
@@ -2325,373 +1529,80 @@ def initialize_application(args) -> Tuple[SourceType, AuthenticationManager, str
     source_type = SourceType(args.source)
     auth_manager = AuthenticationManager()
     
-    # Authenticate
-    token = auth_manager.authenticate(source_type, args.organization)
+    # Authenticate with token from --token flag or environment variables
+    token = auth_manager.authenticate(source_type, args.organization, args.token)
     if not token:
-        safe_print("❌ Authentication failed. Please check your credentials.")
+        safe_print("Error: Authentication failed. Please check your token (use --token or environment variables).")
         raise AuthenticationError("Authentication failed")
     
     return source_type, auth_manager, token
 
 
-def initialize_scanning_components(auth_manager: AuthenticationManager, source_type: SourceType, results_dir: str) -> Tuple:
+def initialize_scanning_components(auth_manager: AuthenticationManager, source_type: SourceType, results_dir: str) -> Tuple[TerraformFileScanner, RepositoryDiscovery, RepositoryScanner, ResultsManager]:
     """Initialize all scanning components."""
     file_scanner = TerraformFileScanner()
     repo_discovery = RepositoryDiscovery(source_type, auth_manager)
-    repo_scanner = RepositoryScanner(source_type, auth_manager, file_scanner)
+    version_checker = GitModuleVersionChecker(auth_manager)
+    repo_scanner = RepositoryScanner(source_type, auth_manager, file_scanner, version_checker)
     results_manager = ResultsManager(results_dir)
     
     # Display initialization info in a clean, organized way
-    safe_print(f"� Initializing scanner components...")
-    safe_print(f"   📄 File patterns: {', '.join(file_scanner.terraform_file_patterns)}")
-    safe_print(f"   🚫 Ignore patterns: {len(file_scanner.ignore_patterns)} defined")
-    safe_print()  # Empty line for spacing
+    logger.debug("Scanner initialized")
     
     return file_scanner, repo_discovery, repo_scanner, results_manager
 
 
-def discover_and_validate_repositories(args, repo_discovery: RepositoryDiscovery, token: str) -> List[Repository]:
-    """Discover repositories and validate the discovery results."""
-    # Parse project filter if provided
-    project_filter = None
-    if args.projects:
-        project_filter = [p.strip() for p in args.projects.split(',')]
-        safe_print(f"🎯 Project filter: {project_filter}")
+def get_single_repository(args: argparse.Namespace, repo_discovery: RepositoryDiscovery, token: str) -> Optional[Repository]:
+    """Get the single repository to scan."""
+    logger.debug("Locating repository")
     
-    safe_print("\n🚀 Starting repository discovery...")
+    # Get the specific repository
+    repository = repo_discovery.get_repository(args.organization, args.project, args.repository, token)
     
-    # Discover repositories
-    repositories = repo_discovery.discover_repositories(args.organization, token, project_filter)
+    if not repository:
+        safe_print(f"Error: Repository not found: {args.organization}/{args.project}/{args.repository}")
+        return None
     
-    if not repositories:
-        safe_print("⚠️ No repositories found to scan")
-        return []
+    logger.debug(f"Repository located: {repository.full_name}")
     
-    safe_print(f"📁 Repository Discovery Complete:")
-    safe_print(f"   Found {len(repositories)} repositories")
-    if project_filter:
-        safe_print(f"   Projects: {', '.join(set(r.project_name for r in repositories))}")
-    
-    return repositories
+    return repository
 
 
-def discover_and_validate_repositories(args, repo_discovery: RepositoryDiscovery, token: str) -> List[Repository]:
-    """Discover and validate repositories based on arguments."""
-    # Parse project filter if provided
-    project_filter = None
-    if args.projects:
-        project_filter = [p.strip() for p in args.projects.split(',')]
-        safe_print(f"🎯 Project filter: {project_filter}")
-    
-    safe_print("� Starting repository discovery...")
-    
-    # Discover repositories
-    repositories = repo_discovery.discover_repositories(args.organization, token, project_filter)
-    
-    if not repositories:
-        safe_print("⚠️ No repositories found to scan")
-        return []
-    
-    safe_print(f"📁 Repository discovery completed: {len(repositories)} repositories found")
-    if project_filter:
-        safe_print(f"   🎯 Projects: {', '.join(set(r.project_name for r in repositories))}")
-    safe_print()  # Empty line for spacing
-    
-    return repositories
-
-
-def execute_main_scanning_process(args, repositories: List[Repository], repo_scanner: RepositoryScanner, results_manager: ResultsManager) -> int:
-    """Execute the main scanning process and generate reports."""
+def execute_single_repository_scan(args: argparse.Namespace, repository: Repository, repo_scanner: RepositoryScanner, results_manager: ResultsManager, token: str, source_type: SourceType) -> int:
+    """Execute scan on single repository and save results."""
     from datetime import datetime
     
-    # Initialize scan summary
-    summary = ScanSummary(
-        organization=args.organization,
-        source_type=SourceType(args.source),
-        scan_timestamp=datetime.now().isoformat(),
-        total_repositories=len(repositories)
-    )
-    
-    safe_print("🔍 Starting Terraform module scanning...")
-    safe_print(f"📊 Progress: {format_progress(0, len(repositories))}")
+    logger.debug("Starting Terraform module scanning")
     
     start_time = datetime.now()
-    all_results = []
     
-    # Execute scanning based on processing mode
-    if repo_scanner.use_concurrent_processing and len(repositories) > 1:
-        all_results = execute_concurrent_scanning_workflow(args, repositories, repo_scanner, start_time)
-    else:
-        all_results = execute_sequential_scanning_workflow(args, repositories, repo_scanner, start_time)
+    # Scan the repository
+    try:
+        result = repo_scanner.scan_repository(repository, args.organization, token)
+    except Exception as e:
+        safe_print(f"Error: Failed to scan repository: {e}")
+        logger.error(f"Scan error: {e}")
+        return 1
     
-    safe_print()  # Empty line after progress completion
+    # Save results
+    output_file = results_manager.save_scan_results(
+        result, 
+        args.organization, 
+        args.project, 
+        args.repository,
+        source_type,
+        filters=args.filter
+    )
     
-    # Update summary with all results
-    for result in all_results:
-        summary.add_scan_result(result)
-    
-    # Generate and display final report
-    generate_final_report(args, summary, all_results, start_time, results_manager)
+    # Display minimal summary for CI/CD
+    total_time = (datetime.now() - start_time).total_seconds()
+    safe_print(f"Scanned {result.total_files_scanned} files, found {result.total_modules_found} modules ({result.local_modules_found} local, {result.git_modules_found} git) in {format_duration(total_time)}")
+    safe_print(f"Results: {output_file}")
     
     return 0
 
 
-def execute_concurrent_scanning_workflow(args, repositories: List[Repository], repo_scanner: RepositoryScanner, start_time) -> List[ScanResult]:
-    """Execute the concurrent scanning workflow."""
-    from datetime import datetime
-    
-    def progress_callback(completed: int, total: int, result: ScanResult):
-        progress_pct = (completed / total) * UTMSConfig.PERCENTAGE_MULTIPLIER
-        elapsed = (datetime.now() - start_time).total_seconds()
-        eta_per_repo = elapsed / completed if completed > 0 else 0
-        remaining_repos = total - completed
-        eta_remaining = eta_per_repo * remaining_repos if remaining_repos > 0 else 0
-        
-        progress_info = format_progress(completed, total, "📊 ")
-        eta_info = f"ETA: {format_duration(eta_remaining)}" if eta_remaining > 0 else "Almost done!"
-        
-        modules_found = result.registry_modules_found if result else 0
-        safe_print(f"{progress_info} {eta_info}")
-        safe_print(f"[{completed}/{total}] Completed: {result.repository_name} - {modules_found} modules")
-    
-    return repo_scanner.scan_repositories_concurrent(repositories, args.organization, 
-                                                   repo_scanner.auth_manager.get_token(SourceType.AZURE_DEVOPS, args.organization), progress_callback)
-
-
-def execute_sequential_scanning_workflow(args, repositories: List[Repository], repo_scanner: RepositoryScanner, start_time) -> List[ScanResult]:
-    """Execute the sequential scanning workflow."""
-    from datetime import datetime
-    
-    all_results = []
-    
-    for i, repository in enumerate(repositories, 1):
-        elapsed = (datetime.now() - start_time).total_seconds()
-        eta_per_repo = elapsed / i if i > 0 else 0
-        remaining_repos = len(repositories) - i
-        eta_remaining = eta_per_repo * remaining_repos
-        
-        progress_info = format_progress(i, len(repositories), "📊 ")
-        eta_info = f"ETA: {format_duration(eta_remaining)}" if eta_remaining > 0 else "Almost done!"
-        
-        safe_print(f"\n{progress_info} {eta_info}")
-        safe_print(f"[{i}/{len(repositories)}] Scanning: {repository.full_name}")
-        
-        try:
-            result = repo_scanner.scan_repository(repository, args.organization, 
-                                                repo_scanner.auth_manager.get_token(SourceType.AZURE_DEVOPS, args.organization))
-            all_results.append(result)
-            
-            if not result.repository_accessible:
-                safe_print(f"   🔒 Repository disabled or inaccessible")
-            elif result.registry_modules_found > 0:
-                safe_print(f"   📦 Found {result.registry_modules_found} registry modules in {result.total_files_scanned} files")
-            else:
-                safe_print(f"   📄 Scanned {result.total_files_scanned} files - no registry modules found")
-        
-        except Exception as e:
-            logger.error(f"Error scanning repository {repository.full_name}: {e}")
-            continue
-    
-    return all_results
-
-
-def generate_final_report(args, summary: ScanSummary, all_results: List[ScanResult], start_time, results_manager: ResultsManager) -> None:
-    """Generate and display the final scan report."""
-    from datetime import datetime
-    
-    # Generate final report
-    total_time = (datetime.now() - start_time).total_seconds()
-    disabled_count = sum(1 for result in all_results if not result.repository_accessible)
-    accessible_repos = summary.total_repositories - disabled_count
-    
-    # Pre-calculate version status counts for display if TMVS cross-reference is enabled
-    tmvs_dir = getattr(args, 'cross_reference', None)
-    if tmvs_dir:
-        # Create temporary output data structure to calculate version status counts
-        source_type = SourceType(args.source)
-        temp_output_data = results_manager._build_output_data_structure(args.organization, source_type, summary, {})
-        results_manager._add_detailed_repository_results(temp_output_data, all_results, results_manager._load_tmvs_data_for_enrichment(tmvs_dir))
-        results_manager._calculate_version_status_counts(temp_output_data, summary)
-    
-    # Display basic scan summary
-    detailed_results = temp_output_data.get("detailed_results", []) if tmvs_dir else []
-    display_scan_summary(args, summary, total_time, accessible_repos, disabled_count, detailed_results)
-    
-    # Display performance metrics only in debug mode
-    if args.debug:
-        display_performance_metrics(total_time, all_results, summary)
-    
-    # Module statistics section removed per user request
-    
-    # Save results and show completion status
-    save_and_display_results(args, summary, all_results, results_manager)
-
-
-def display_version_status_summary(version_status_counts: Dict[str, int], detailed_results: List[dict] = None) -> None:
-    """Display the version status summary with color indicators and detailed listings."""
-    safe_print(f"   📊 Module version health:")
-    safe_print(f"      🟢 Current: {version_status_counts.get('current', 0)}")
-    safe_print(f"      🟠 Outdated: {version_status_counts.get('outdated', 0)}")
-    safe_print(f"      🔴 Critical: {version_status_counts.get('critical', 0)}")
-    if version_status_counts.get('unknown', 0) > 0:
-        safe_print(f"      ⚪ Unknown: {version_status_counts.get('unknown', 0)}")
-    
-    # Display detailed listings for outdated and critical modules
-    if detailed_results:
-        _display_detailed_version_issues(detailed_results, version_status_counts)
-
-
-def _display_detailed_version_issues(detailed_results: List[dict], version_status_counts: Dict[str, int]) -> None:
-    """Display detailed listings of outdated and critical modules."""
-    outdated_modules, critical_modules = _collect_modules_by_status(detailed_results)
-    _display_outdated_modules(outdated_modules)
-    _display_critical_modules(critical_modules)
-
-
-def _collect_modules_by_status(detailed_results: List[dict]) -> Tuple[Dict[str, dict], Dict[str, dict]]:
-    """Collect and deduplicate modules by their version status."""
-    outdated_modules = {}
-    critical_modules = {}
-    
-    for repo_result in detailed_results:
-        repository_info = repo_result.get('repository', {})
-        repository_name = repository_info.get('name', 'unknown')
-        project_name = repository_info.get('project', '')
-        
-        for module in repo_result.get("modules", []):
-            status = module.get("version_status", "unknown")
-            
-            # Create a unique key for deduplication (source + current version + target version + constraint)
-            # This ensures that modules with different version states remain separate
-            constraint = module.get('version', '') or 'none'
-            module_key = f"{module.get('source', 'unknown')}:{module.get('resolved_version', 'unknown')}:{module.get('latest_version', 'unknown')}:{constraint}"
-            
-            if status == "outdated":
-                _add_module_to_collection(outdated_modules, module_key, module, project_name, repository_name)
-            elif status == "critical":
-                _add_module_to_collection(critical_modules, module_key, module, project_name, repository_name)
-    
-    return outdated_modules, critical_modules
-
-
-def _add_module_to_collection(modules_dict: Dict[str, dict], module_key: str, module: dict, project_name: str, repository_name: str) -> None:
-    """Add a module to the collection, creating entry if needed."""
-    if module_key not in modules_dict:
-        modules_dict[module_key] = {
-            'source': module.get('source', 'unknown'),
-            'local_name': module.get('local_name', 'unknown'),
-            'resolved_version': module.get('resolved_version', 'unknown'),
-            'latest_version': module.get('latest_version', 'unknown'),
-            'locations': []
-        }
-    # Add location to this module
-    repo_path = f"{project_name}/{repository_name}" if project_name else repository_name
-    modules_dict[module_key]['locations'].append(repo_path)
-
-
-def _display_outdated_modules(outdated_modules: Dict[str, dict]) -> None:
-    """Display outdated modules section."""
-    if not outdated_modules:
-        return
-        
-    safe_print(f"\n   🟠 Outdated modules (1 major version behind):")
-    for module in outdated_modules.values():
-        _display_module_info(module)
-
-
-def _display_critical_modules(critical_modules: Dict[str, dict]) -> None:
-    """Display critical modules section."""
-    if not critical_modules:
-        return
-        
-    safe_print(f"\n   🔴 Critical modules (2+ major versions behind):")
-    for module in critical_modules.values():
-        _display_module_info(module)
-
-
-def _display_module_info(module: dict) -> None:
-    """Display individual module information with formatting."""
-    # Format location names with bold and quotes for prominence
-    formatted_locations = []
-    for location in module['locations']:
-        formatted_locations.append(f"{UTMSConfig.ANSI_BOLD}\"{location}\"{UTMSConfig.ANSI_RESET}")
-    locations_str = ", ".join(formatted_locations)
-    
-    if module['local_name'] != 'unknown':
-        # Make local name prominent with bold formatting and quotes
-        display_name = f"{UTMSConfig.ANSI_BOLD}\"{module['local_name']}\"{UTMSConfig.ANSI_RESET} ({module['source']})"
-    else:
-        display_name = module['source']
-    safe_print(f"      • {display_name}")
-    safe_print(f"        {module['resolved_version']} → {module['latest_version']} in {locations_str}")
-
-
-def display_scan_summary(args, summary: ScanSummary, total_time: float, accessible_repos: int, disabled_count: int, detailed_results: List[dict] = None) -> None:
-    """Display the basic scan summary information."""
-    safe_print(f"\n📋 Scan complete - summary:")
-    safe_print(f"   🏢 Organization: {args.organization}")
-    safe_print(f"   ⏱️  Total time: {format_duration(total_time)}")
-    safe_print(f"   📂 Repositories discovered: {summary.total_repositories}")
-    safe_print(f"   ✅ Repositories accessible: {accessible_repos}")
-    if disabled_count > 0:
-        safe_print(f"   🔒 Repositories disabled/inaccessible: {disabled_count}")
-    safe_print(f"   📄 Files scanned: {summary.total_files_scanned}")
-    safe_print(f"   📦 Total registry modules found: {summary.total_registry_modules}")
-    
-    # Display version status summary if available
-    if summary.version_status_counts:
-        display_version_status_summary(summary.version_status_counts, detailed_results)
-
-
-def display_performance_metrics(total_time: float, all_results: List[ScanResult], summary: ScanSummary) -> None:
-    """Display performance metrics if scanning took measurable time."""
-    if total_time > 0:
-        repos_per_second = len(all_results) / total_time
-        files_per_second = summary.total_files_scanned / total_time
-        safe_print(f"   🚀 Performance: {repos_per_second:.1f} repos/sec, {files_per_second:.1f} files/sec")
-
-
-def display_module_statistics(summary: ScanSummary) -> None:
-    """Display module statistics if any registry modules were found."""
-    if summary.total_registry_modules > 0:
-        safe_print(f"\n📊 Module Statistics:")
-        
-        # Top registries
-        if summary.modules_by_registry:
-            safe_print(f"   Registries used:")
-            for registry, count in sorted(summary.modules_by_registry.items(), key=lambda x: x[1], reverse=True)[:3]:
-                safe_print(f"     • {registry}: {count} modules")
-        
-        # Top providers
-        if summary.modules_by_provider:
-            safe_print(f"   Top providers:")
-            for provider, count in sorted(summary.modules_by_provider.items(), key=lambda x: x[1], reverse=True)[:3]:
-                safe_print(f"     • {provider}: {count} modules")
-        
-        # Version constraint distribution
-        if summary.version_constraints_used:
-            safe_print(f"   Version constraints:")
-            for constraint_type, count in sorted(summary.version_constraints_used.items(), key=lambda x: x[1], reverse=True):
-                constraint_name = constraint_type.replace('_', ' ').title()
-                safe_print(f"     • {constraint_name}: {count} modules")
-
-
-def save_and_display_results(args, summary: ScanSummary, all_results: List[ScanResult], results_manager: ResultsManager) -> None:
-    """Save results and display completion status."""
-    # Save results (with TMVS enrichment if cross-reference requested)
-    tmvs_dir = getattr(args, 'cross_reference', None)
-    output_file = results_manager.save_scan_results(args.organization, SourceType(args.source), all_results, summary, tmvs_dir)
-    
-    safe_print(f"\n💾 Detailed results saved to: {output_file}")
-    
-    # Show enrichment status
-    if tmvs_dir:
-        safe_print(f"🔗 Results enriched with TMVS data from: {tmvs_dir}")
-    
-    safe_print(f"\n✅ UTMS scan completed successfully!")
-
-
-def setup_application(args) -> None:
+def setup_application(args: argparse.Namespace) -> None:
     """Setup application configuration and logging."""
     # Ignore SIGPIPE to prevent broken pipe errors when piping to head/tail
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
@@ -2699,16 +1610,11 @@ def setup_application(args) -> None:
     if args.debug:
         # Enable both INFO and DEBUG messages in debug mode
         logging.getLogger().setLevel(logging.INFO)
-    
-    # Display clean application header
-    safe_print(f"🚀 UTMS v{__version__} - Universal Terraform Module Scanner")
-    safe_print(f"🎯 Source: {args.source} | 🏢 Organization: {args.organization}")
-    if args.debug:
-        safe_print(f"🐛 Debug mode enabled")
-    safe_print()  # Empty line for spacing
+        logger.debug(f"UTMS - Source: {args.source}")
+        safe_print(f"Debug mode enabled")
 
 
-def run_application_workflow(args) -> int:
+def run_application_workflow(args: argparse.Namespace) -> int:
     """Run the complete application workflow."""
     try:
         # Initialize application and authenticate
@@ -2721,17 +1627,17 @@ def run_application_workflow(args) -> int:
         # Initialize scanning components
         file_scanner, repo_discovery, repo_scanner, results_manager = initialize_scanning_components(auth_manager, source_type, results_dir)
         
-        # Clean existing results if requested
+        # Clean existing result file if requested
         if args.clean:
-            results_manager.clean_existing_results(args.organization, source_type)
+            results_manager.clean_specific_result(args.organization, args.project, args.repository)
         
-        # Discover repositories
-        repositories = discover_and_validate_repositories(args, repo_discovery, token)
-        if not repositories:
-            return 0
+        # Get the specific repository
+        repository = get_single_repository(args, repo_discovery, token)
+        if not repository:
+            return 1
         
-        # Execute main scanning process
-        return execute_main_scanning_process(args, repositories, repo_scanner, results_manager)
+        # Execute single repository scan
+        return execute_single_repository_scan(args, repository, repo_scanner, results_manager, token, source_type)
         
     except KeyboardInterrupt:
         safe_print(f"\n⏹️  Scan interrupted by user")
