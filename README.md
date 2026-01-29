@@ -232,15 +232,10 @@ jobs:
       REPOSITORY="$(Build.Repository.Name)"
       BRANCH="$(Build.SourceBranchName)"
 
-      ./utms \
-        --source azure-devops \
-        --organization "$ORGANIZATION" \
-        --project "$PROJECT" \
-        --repository "$REPOSITORY" \
-        --clean
+      ./utms --source azure-devops --organization "$ORGANIZATION" --project "$PROJECT" --repository "$REPOSITORY" --clean
     displayName: Run UTMS Module Scan
     env:
-      AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+      AZURE_DEVOPS_PAT: $(System.AccessToken)
       GITHUB_TOKEN: $(GITHUB_TOKEN)
 
   - script: |
