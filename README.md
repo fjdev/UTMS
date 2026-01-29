@@ -22,10 +22,15 @@ A tool for scanning source code repositories to discover and analyze Terraform m
 ### Installation
 
 ```bash
-# Download the executable (example - adjust URL to your distribution method)
-wget utms  # or download from your preferred location
+# Clone the repository
+git clone https://github.com/fjdev/UTMS.git
+cd UTMS
+
+# Make executable
 chmod +x utms
+
 # Ready to use!
+./utms --version
 ```
 
 ### Basic Usage
@@ -201,16 +206,18 @@ pr:
       - main
 
 variables:
-  UTMS_VERSION: 'v2.0.0'
+  UTMS_VERSION: 'main'
   FAIL_ON_OUTDATED: 'false'
 
 jobs:
 - job: Scan
   displayName: Terraform Module Compliance Scan
+  timeoutInMinutes: 15
   pool:
     vmImage: 'ubuntu-latest'
   steps:
   - checkout: self
+    displayName: Checkout repository
     persistCredentials: true
 
   - task: UsePythonVersion@0
@@ -219,11 +226,13 @@ jobs:
       versionSpec: '3.x'
 
   - script: |
+      set -e
       curl -sSfL "https://raw.githubusercontent.com/fjdev/UTMS/$(UTMS_VERSION)/utms" -o utms
       chmod +x utms
-    displayName: Download UTMS
+    displayName: Install UTMS
 
   - script: |
+      set -e
       COLLECTION_URI="$(System.TeamFoundationCollectionUri)"
       COLLECTION_URI="${COLLECTION_URI%/}"
       ORGANIZATION="${COLLECTION_URI##*/}"
@@ -233,7 +242,8 @@ jobs:
       BRANCH="$(Build.SourceBranchName)"
 
       ./utms --source azure-devops --organization "$ORGANIZATION" --project "$PROJECT" --repository "$REPOSITORY" --clean
-    displayName: Run UTMS Module Scan
+    name: RunUTMS
+    displayName: Scan Terraform modules
     env:
       AZURE_DEVOPS_PAT: $(System.AccessToken)
       GITHUB_TOKEN: $(GITHUB_TOKEN)
@@ -269,6 +279,72 @@ jobs:
           branch_q = urllib.parse.quote(branch, safe="")
           url = f"{collection_uri}/{project}/_git/{repository}?path={path_q}&version=GB{branch_q}"
           return f"[`{clean_path}`]({url})"
+
+      def module_link(source: str, version: str = None, file_path: str = None) -> str:
+          """Create a clickable link for module sources."""
+          # Handle Git-based modules
+          if source and source.startswith("git::"):
+              try:
+                  git_url = source.replace("git::", "", 1)
+                  
+                  # Extract ref if present
+                  ref = None
+                  if "?ref=" in git_url:
+                      git_url, ref_part = git_url.split("?ref=", 1)
+                      ref = ref_part.split("&")[0].split("?")[0]
+                  
+                  # Split on .git// to separate repo from module path
+                  if ".git//" in git_url:
+                      base_url = git_url.split(".git//")[0] + ".git"
+                  elif git_url.endswith(".git"):
+                      base_url = git_url
+                  else:
+                      base_url = git_url.split("//")[0] if "//" in git_url and git_url.count("//") > 1 else git_url
+                  
+                  # Remove .git extension for display
+                  display_url = base_url.rstrip(".git")
+                  
+                  # For GitHub URLs, create tree link
+                  if "github.com" in display_url:
+                      display_text = display_url
+                      if ref:
+                          url = f"{display_url}/tree/{ref}"
+                          display_text += f"@{ref}"
+                      else:
+                          url = display_url
+                      return f"[{display_text}]({url})"
+                  
+                  # For other git URLs
+                  display_text = display_url
+                  if ref:
+                      display_text += f"@{ref}"
+                  return f"[{display_text}]({display_url})"
+              except Exception:
+                  return source
+          
+          # Handle local module paths
+          if source and (source.startswith("../") or source.startswith("./")):
+              try:
+                  from pathlib import Path
+                  
+                  # Resolve relative path from the file location
+                  if file_path:
+                      file_dir = str(Path(file_path).parent)
+                      resolved = str(Path(file_dir).joinpath(source).resolve())
+                      # Make it relative to repo root
+                      if resolved.startswith("/"):
+                          resolved = resolved.lstrip("/")
+                      
+                      # Create Azure DevOps link if we have the connection info
+                      if collection_uri and project and repository:
+                          path_q = urllib.parse.quote("/" + resolved, safe="")
+                          branch_q = urllib.parse.quote(branch, safe="")
+                          url = f"{collection_uri}/{project}/_git/{repository}?path={path_q}&version=GB{branch_q}"
+                          return f"[{source}]({url})"
+              except Exception:
+                  pass
+          
+          return source
 
       def format_scan_date(ts: str) -> str:
           if not ts:
@@ -309,7 +385,13 @@ jobs:
           for module in sorted(modules, key=lambda m: (m.get("file_path", ""), m.get("local_name", ""))):
               file_path = module.get("file_path", "")
               local_name = module.get("local_name", "")
-              source = module.get("source", "")[:50] + "..." if len(module.get("source", "")) > 50 else module.get("source", "")
+              raw_source = module.get("source", "")
+              source = module_link(raw_source, module.get("version"), file_path)
+              
+              # Don't truncate links, only truncate plain text
+              if len(source) > 80 and not source.startswith("["):
+                  source = source[:77] + "..."
+              
               current = module.get("version") or "-"
               latest = module.get("latest_version") or "-"
               
@@ -332,17 +414,16 @@ jobs:
     displayName: Generate markdown report
     condition: always()
 
-  # Render markdown report directly in the pipeline summary
   - script: |
       echo "##vso[task.uploadsummary]$(System.DefaultWorkingDirectory)/module-report.md"
-    displayName: Publish report to pipeline summary
+    displayName: Publish report summary
     condition: always()
 
   - task: PublishBuildArtifacts@1
-    displayName: Publish scan results
+    displayName: Publish scan artifacts
     inputs:
       PathtoPublish: 'results'
-      ArtifactName: 'module-scan-results'
+      ArtifactName: 'utms-scan-results'
     condition: always()
 ```
 
